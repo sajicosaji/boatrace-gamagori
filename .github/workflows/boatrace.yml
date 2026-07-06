@@ -1,0 +1,30 @@
+name: BoatRace Auto Discord
+
+on:
+  schedule:
+    # 日本時間 15:00〜21:00 の間、15分おきに実行
+    # UTC = JST - 9時間
+    - cron: "0,15,30,45 6-12 * * *"
+  workflow_dispatch:  # 手動実行ボタン
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run check and send
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          AHEAD_MINUTES: "10"
+          CHECK_INTERVAL: "15"
+          PYTHONIOENCODING: "utf-8"
+        run: python check_and_send.py
