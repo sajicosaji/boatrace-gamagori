@@ -2,10 +2,8 @@ name: BoatRace Auto Discord
 
 on:
   schedule:
-    # 日本時間 15:00〜21:00 の間、15分おきに実行
-    # UTC = JST - 9時間
     - cron: "0,15,30,45 6-12 * * *"
-  workflow_dispatch:  # 手動実行ボタン
+  workflow_dispatch:
 
 jobs:
   send:
