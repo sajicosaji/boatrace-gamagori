@@ -6,18 +6,25 @@
   /course    : コース別通算成績（進入率/3連対率/ST平均/スタート順）
   /back3     : 直近3節の着順
   /season    : 現在期（約半年）の総合成績
+
+予想: 13要素スコアリング + 気象補正 + 市場オッズブレンド
+買い目: Plackett-Luce モデルで 2連単/3連単 の的中確率を計算し、
+        レースの自信度（鉄板/有力/接戦/混戦）に応じて点数を可変にする。
 """
 
 import argparse
-import itertools
+import json
 import re
 import statistics
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 VENUE_CODE = "07"  # 蒲郡
 BASE_URL   = "https://www.boatrace.jp"
@@ -31,6 +38,9 @@ HEADERS    = {
 # 蒲郡の艇番別1着率（過去統計ベース）
 LANE_WIN_RATE = {1: 0.555, 2: 0.105, 3: 0.100, 4: 0.085, 5: 0.085, 6: 0.070}
 
+# 市場オッズを予想勝率にブレンドする比率（0で無効）
+ODDS_BLEND = 0.25
+
 # 全角→半角数字変換テーブル
 FW2HW = str.maketrans("０１２３４５６７８９", "0123456789")
 
@@ -39,13 +49,58 @@ FW2HW = str.maketrans("０１２３４５６７８９", "0123456789")
 #  ユーティリティ
 # ─────────────────────────────────────────────
 
+def _make_session() -> requests.Session:
+    """リトライ付き共有セッション（一時的なネットワーク断・5xxに耐える）"""
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.5,
+                  status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=["GET"])
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    s.mount("https://", adapter)
+    s.headers.update(HEADERS)
+    return s
+
+SESSION = _make_session()
+
 def _vals(cell) -> list[str]:
     return [v.strip() for v in cell.get_text(separator="\n").split("\n") if v.strip()]
 
 def _fetch(url: str) -> BeautifulSoup:
-    r = requests.get(url, headers=HEADERS, timeout=30)
+    r = SESSION.get(url, timeout=30)
     r.raise_for_status()
     return BeautifulSoup(r.content, "html.parser")
+
+def load_webhook_url() -> str:
+    """Discord Webhook URL を環境変数 → discord_webhook.txt の順で探す"""
+    import os
+    url = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    if not url:
+        f = Path(__file__).parent / "discord_webhook.txt"
+        if f.exists():
+            url = f.read_text(encoding="utf-8-sig").strip()
+    return url
+
+def fetch_schedule(date: str) -> list[dict]:
+    """当日の全レース締切予定時刻を取得。[{"race_no": 1, "締切": "15:28"}, ...]"""
+    url = f"{BASE_URL}/owpc/pc/race/racelist?hd={date}&jcd={VENUE_CODE}&rno=1"
+    try:
+        soup = _fetch(url)
+    except Exception as e:
+        print(f"  スケジュール取得エラー: {e}")
+        return []
+    races = []
+    for tbl in soup.find_all("table"):
+        rows = tbl.find_all("tr")
+        if len(rows) < 2:
+            continue
+        header = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
+        if header and header[0] == "レース" and "1R" in header:
+            times = [c.get_text(strip=True) for c in rows[1].find_all(["th", "td"])][1:]
+            for i, t in enumerate(times):
+                if re.match(r"\d{1,2}:\d{2}", t):
+                    races.append({"race_no": i + 1, "締切": t})
+            break
+    return races
 
 def _num(s: str | None) -> float | None:
     if not s:
@@ -426,10 +481,14 @@ def fetch_player_season_stats(toban: int) -> dict:
     }
 
 
+# 選手統計のプロセス内キャッシュ（全レース予想・バックテストで同じ選手を再取得しない）
+_PLAYER_STATS_CACHE: dict[int, tuple[dict, dict, dict]] = {}
+
+
 def fetch_all_players_stats(boats: list[dict]) -> None:
     """
     全6選手のコース別・直近3節・期別成績を ThreadPoolExecutor で並列取得（in-place 更新）。
-    1選手あたり最大3リクエスト × 6選手 = 最大18リクエスト。
+    1選手あたり最大3リクエスト × 6選手 = 最大18リクエスト。取得済み選手はキャッシュを使う。
     """
     boat_map = {b["艇番"]: b for b in boats}
 
@@ -437,11 +496,17 @@ def fetch_all_players_stats(boats: list[dict]) -> None:
         toban = boat.get("登録番号")
         if not toban:
             return boat["艇番"], {}, {}, {}
+        if toban in _PLAYER_STATS_CACHE:
+            c, r, s = _PLAYER_STATS_CACHE[toban]
+            return boat["艇番"], c, r, s
         with ThreadPoolExecutor(max_workers=3) as ex:
             fc = ex.submit(fetch_player_course_stats, toban)
             fr = ex.submit(fetch_player_recent_stats, toban)
             fs = ex.submit(fetch_player_season_stats, toban)
-            return boat["艇番"], fc.result(), fr.result(), fs.result()
+            c, r, s = fc.result(), fr.result(), fs.result()
+        if c or r or s:
+            _PLAYER_STATS_CACHE[toban] = (c, r, s)
+        return boat["艇番"], c, r, s
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(_fetch_one, b) for b in boats]
@@ -459,19 +524,23 @@ def fetch_all_players_stats(boats: list[dict]) -> None:
 #  データ統合
 # ─────────────────────────────────────────────
 
-def get_race_data(date: str, race_no: int) -> tuple[list[dict], dict]:
+def get_race_data(date: str, race_no: int, quiet: bool = False) -> tuple[list[dict], dict]:
     """1レース分の全データと気象条件を返す"""
-    print("  出走表を取得中...", end="", flush=True)
-    boats = fetch_racelist(date, race_no)
-    print(f" {len(boats)}艇 OK")
+    def _p(*a, **kw):
+        if not quiet:
+            print(*a, **kw)
 
-    print("  展示前情報・気象データ・単勝オッズを取得中...", end="", flush=True)
+    _p("  出走表を取得中...", end="", flush=True)
+    boats = fetch_racelist(date, race_no)
+    _p(f" {len(boats)}艇 OK")
+
+    _p("  展示前情報・気象データ・単勝オッズを取得中...", end="", flush=True)
     with ThreadPoolExecutor(max_workers=2) as ex:
         f_bi   = ex.submit(fetch_beforeinfo, date, race_no)
         f_odds = ex.submit(fetch_odds_win,   date, race_no)
     bi, conditions = f_bi.result()
     odds           = f_odds.result()
-    print(" OK")
+    _p(" OK")
 
     for b in boats:
         info = bi.get(b["艇番"], {})
@@ -483,9 +552,9 @@ def get_race_data(date: str, race_no: int) -> tuple[list[dict], dict]:
         b["調整重量"]   = info.get("調整重量")
         b["単勝オッズ"] = odds.get(b["艇番"])
 
-    print("  選手統計を並列取得中（コース別通算/直近3節/現在期）...", flush=True)
+    _p("  選手統計を並列取得中（コース別通算/直近3節/現在期）...", flush=True)
     fetch_all_players_stats(boats)
-    print("  完了")
+    _p("  完了")
 
     return boats, conditions
 
@@ -496,7 +565,7 @@ def get_race_data(date: str, race_no: int) -> tuple[list[dict], dict]:
 
 def predict(boats: list[dict], conditions: dict | None = None) -> list[dict]:
     """
-    11要素による予想スコアリング。気象条件による展示タイム信頼度補正付き。
+    13要素による予想スコアリング。気象条件による展示タイム信頼度補正付き。
 
     ベース  : 蒲郡コース有利度（1コース約55%）
     補正①  : 選手スキル（全国/当地勝率）
@@ -510,12 +579,17 @@ def predict(boats: list[dict], conditions: dict | None = None) -> list[dict]:
     補正⑨  : コース別3連対率（今日の進入コースでの通算実績）← 重要
     補正⑩  : 直近3節の1着率（最近の状態）
     補正⑪  : 現在期の能力指数
+    補正⑫  : コース別ST平均（当該コースでのスタート力）
+    補正⑬  : 直近3節の平均着順（安定した上位着を評価）
 
     気象補正:
       波高 >= 10cm → 外コース（4-6）の展示タイム補正を50%に減衰（荒水面）
       波高 >=  5cm → 外コース（4-6）の展示タイム補正を75%に減衰
       風速 >=  7m  → 全艇の展示タイム補正を50%に減衰（高風速）
       風速 >=  4m  → 全艇の展示タイム補正を70%に減衰
+
+    最後に市場（単勝オッズ）の含意確率を ODDS_BLEND の比率でブレンドし、
+    モデル単独の見落としを市場の知恵で補正する（全艇のオッズが取れた時のみ）。
     """
     cond  = conditions or {}
     wave  = cond.get("波高", 0) or 0
@@ -597,24 +671,119 @@ def predict(boats: list[dict], conditions: dict | None = None) -> list[dict]:
         ki = b["期別成績"].get("期_能力指数")
         season_adj = (ki - 50.0) * 0.001 if ki is not None else 0.0
 
+        # ⑫ コース別ST平均（当該コースでのスタート力。0.17が全国平均目安）
+        st_avg_course = cd.get("ST平均")
+        if st_avg_course is not None and 0.01 <= st_avg_course <= 0.40:
+            course_st_adj = max(-0.05, min(0.05, (0.17 - st_avg_course) * 0.4))
+        else:
+            course_st_adj = 0.0
+
+        # ⑬ 直近3節の平均着順（3.5が中央値。サンプル8走以上で適用）
+        r_avg = b["直近3節"].get("直近平均着順")
+        r_n   = b["直近3節"].get("直近出走数", 0)
+        if r_avg is not None and r_n >= 8:
+            recent_avg_adj = max(-0.05, min(0.05, (3.5 - r_avg) * 0.02))
+        else:
+            recent_avg_adj = 0.0
+
         total_adj = (skill_adj + grade_adj + motor_adj + ex_adj
                      + weight_adj + st_adj + fl_adj + kosetsu_adj
-                     + c3rate_adj + recent_adj + season_adj)
+                     + c3rate_adj + recent_adj + season_adj
+                     + course_st_adj + recent_avg_adj)
 
         scores.append(max(base * (1.0 + total_adj), 0.001))
 
-    total  = sum(scores)
-    result = [{**b, "予想勝率": sc / total} for b, sc in zip(boats, scores)]
+    total   = sum(scores)
+    model_p = [sc / total for sc in scores]
+
+    # 市場オッズブレンド（全艇のオッズが取得できた時のみ）
+    odds_list = [b.get("単勝オッズ") for b in boats]
+    if ODDS_BLEND > 0 and all(o is not None and o > 1.0 for o in odds_list):
+        implied = [1.0 / o for o in odds_list]
+        s_imp   = sum(implied)
+        market  = [x / s_imp for x in implied]
+        final_p = [(1 - ODDS_BLEND) * mp + ODDS_BLEND * mk
+                   for mp, mk in zip(model_p, market)]
+    else:
+        final_p = model_p
+
+    result = [{**b, "予想勝率": fp, "モデル勝率": mp}
+              for b, fp, mp in zip(boats, final_p, model_p)]
     return sorted(result, key=lambda x: -x["予想勝率"])
 
 
-def recommend_bets(ranked: list[dict]) -> dict[str, list[str]]:
-    top4   = ranked[:4]
-    first  = top4[0]["艇番"]
-    others = [r["艇番"] for r in top4[1:]]
+# ─────────────────────────────────────────────
+#  買い目（Plackett-Luce モデル）
+# ─────────────────────────────────────────────
+
+def _pl_exacta(p: dict[int, float]) -> dict[str, float]:
+    """2連単の全組み合わせの確率。P(i→j) = p_i * p_j / (1 - p_i)"""
+    out = {}
+    for i in p:
+        for j in p:
+            if i != j and p[i] < 1.0:
+                out[f"{i}-{j}"] = p[i] * p[j] / (1 - p[i])
+    return out
+
+
+def _pl_trifecta(p: dict[int, float]) -> dict[str, float]:
+    """3連単の全組み合わせの確率。P(i→j→k) = p_i * p_j/(1-p_i) * p_k/(1-p_i-p_j)"""
+    out = {}
+    for i in p:
+        for j in p:
+            if j == i:
+                continue
+            for k in p:
+                if k in (i, j):
+                    continue
+                d1 = 1 - p[i]
+                d2 = 1 - p[i] - p[j]
+                if d1 > 1e-9 and d2 > 1e-9:
+                    out[f"{i}-{j}-{k}"] = p[i] * (p[j] / d1) * (p[k] / d2)
+    return out
+
+
+def recommend_bets(ranked: list[dict]) -> dict:
+    """
+    自信度に応じて買い目点数を可変にする。
+    蒲郡は1コースの基礎勝率が55%と高いため、閾値は高めに設定。
+      鉄板（◎勝率58%以上）: 2連単2点 / 3連単4点  … 厚く少点数
+      有力（46%以上）      : 2連単3点 / 3連単5点
+      接戦（36%以上）      : 2連単3点 / 3連単6点
+      混戦（36%未満）      : 2連単4点 / 3連単7点  … 広く薄く
+    妙味: モデル勝率 × 単勝オッズ（期待値）が1.2以上の艇を「市場が過小評価」として提示。
+    """
+    p  = {r["艇番"]: r["予想勝率"] for r in ranked}
+    p1 = ranked[0]["予想勝率"]
+
+    if p1 >= 0.58:
+        conf, n2, n3 = "鉄板", 2, 4
+    elif p1 >= 0.46:
+        conf, n2, n3 = "有力", 3, 5
+    elif p1 >= 0.36:
+        conf, n2, n3 = "接戦", 3, 6
+    else:
+        conf, n2, n3 = "混戦", 4, 7
+
+    ex  = sorted(_pl_exacta(p).items(),   key=lambda kv: -kv[1])[:n2]
+    tri = sorted(_pl_trifecta(p).items(), key=lambda kv: -kv[1])[:n3]
+
+    value = []
+    for r in ranked:
+        odds = r.get("単勝オッズ")
+        mp   = r.get("モデル勝率")
+        if odds and mp and mp >= 0.10:
+            ev = mp * odds
+            if ev >= 1.2:
+                value.append({"艇番": r["艇番"], "EV": round(ev, 2), "オッズ": odds})
+
     return {
-        "2連単": [f"{first}-{x}" for x in others],
-        "3連単": [f"{first}-{a}-{b}" for a, b in list(itertools.permutations(others, 2))[:4]],
+        "自信度":   conf,
+        "2連単":    [{"組番": c, "確率": pr} for c, pr in ex],
+        "3連単":    [{"組番": c, "確率": pr} for c, pr in tri],
+        "2連単合成": sum(pr for _, pr in ex),
+        "3連単合成": sum(pr for _, pr in tri),
+        "妙味":     value,
     }
 
 
@@ -701,8 +870,12 @@ def _boat_reason(b: dict, boats: list[dict], conditions: dict) -> list[str]:
     return parts
 
 
+def _fmt_bet_list(bet_items: list[dict]) -> str:
+    return ", ".join(f"{b['組番']}({b['確率']*100:.0f}%)" for b in bet_items)
+
+
 def _build_discord_msg(ranked: list[dict], conditions: dict,
-                       race_label: str, bets: dict[str, list[str]]) -> str:
+                       race_label: str, bets: dict) -> str:
     cond  = conditions or {}
     tenki = cond.get("天候", "不明")
     wind  = cond.get("風速", 0) or 0
@@ -710,7 +883,7 @@ def _build_discord_msg(ranked: list[dict], conditions: dict,
     kion  = f"{cond['気温']:.1f}℃" if cond.get("気温") is not None else "---"
 
     lines = [
-        f"🚤 **【{race_label}】**",
+        f"🚤 **【{race_label}】**  自信度: **{bets['自信度']}**",
         f"📍 {tenki}  気温{kion}  風速{wind}m  波高{wave}cm",
         "```",
     ]
@@ -742,8 +915,10 @@ def _build_discord_msg(ranked: list[dict], conditions: dict,
         lines.append("")
 
     lines.append("```")
-    lines.append(f"📌 2連単: {', '.join(bets['2連単'])}")
-    lines.append(f"📌 3連単: {', '.join(bets['3連単'][:4])}")
+    lines.append(f"📌 2連単: {_fmt_bet_list(bets['2連単'])}")
+    lines.append(f"📌 3連単: {_fmt_bet_list(bets['3連単'])}  [合成{bets['3連単合成']*100:.0f}%]")
+    for v in bets.get("妙味", []):
+        lines.append(f"💰 妙味: {v['艇番']}号艇 単勝{v['オッズ']:.1f}倍（期待値{v['EV']:.2f}）")
     return "\n".join(lines)
 
 
@@ -757,26 +932,48 @@ def send_discord(message: str, webhook_url: str) -> bool:
 
 
 # ─────────────────────────────────────────────
-#  メイン
+#  予想ログ
 # ─────────────────────────────────────────────
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ボートレース蒲郡 予想ツール")
-    parser.add_argument("date",    nargs="?", default="20260705", help="日付 YYYYMMDD")
-    parser.add_argument("race_no", nargs="?", type=int, default=1,  help="レース番号 1-12")
-    parser.add_argument("--discord", action="store_true", help="結果をDiscordに送信")
-    args = parser.parse_args()
+def log_prediction(date: str, race_no: int, ranked: list[dict],
+                   bets: dict, conditions: dict) -> None:
+    """予想内容を logs/predictions.jsonl に追記（後日の検証・的中率集計用）"""
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    rec = {
+        "記録時刻": datetime.now().isoformat(timespec="seconds"),
+        "日付":     date,
+        "レース":   race_no,
+        "予想順":   [r["艇番"] for r in ranked],
+        "予想勝率": {str(r["艇番"]): round(r["予想勝率"], 4) for r in ranked},
+        "自信度":   bets["自信度"],
+        "2連単":    [b["組番"] for b in bets["2連単"]],
+        "3連単":    [b["組番"] for b in bets["3連単"]],
+        "気象":     conditions,
+    }
+    with open(log_dir / "predictions.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    DATE    = args.date
-    RACE_NO = args.race_no
-    W       = 75
-    race_label = f"ボートレース蒲郡  {DATE[:4]}/{DATE[4:6]}/{DATE[6:]}  {RACE_NO}R"
+
+# ─────────────────────────────────────────────
+#  1レース実行（表示 + Discord + ログ）
+# ─────────────────────────────────────────────
+
+W = 75
+
+def run_race(date: str, race_no: int, do_discord: bool = False,
+             detail: bool = True) -> bool:
+    race_label = f"ボートレース蒲郡  {date[:4]}/{date[4:6]}/{date[6:]}  {race_no}R"
 
     print(f"\nデータ取得中... {race_label}")
-    data, conditions = get_race_data(DATE, RACE_NO)
+    try:
+        data, conditions = get_race_data(date, race_no)
+    except Exception as e:
+        print(f"データ取得失敗: {e}")
+        return False
     if not data:
-        print("データ取得失敗")
-        sys.exit(1)
+        print("データ取得失敗（出走表が見つかりません）")
+        return False
 
     cond  = conditions
     wave  = cond.get("波高", 0) or 0
@@ -839,11 +1036,12 @@ if __name__ == "__main__":
     print(f'{"="*W}')
 
     # ── 各艇詳細診断 ──
-    print(f'\n\n{"="*W}')
-    print("【各艇詳細診断】")
-    print(f'{"="*W}')
+    if detail:
+        print(f'\n\n{"="*W}')
+        print("【各艇詳細診断】")
+        print(f'{"="*W}')
 
-    for i, r in enumerate(ranked[:5]):
+    for i, r in enumerate(ranked[:5] if detail else []):
         mark = MARKS[i]
         cd   = r["コース別"]
         rec  = r["直近3節"]
@@ -896,22 +1094,25 @@ if __name__ == "__main__":
 
     # ── 推奨買い目 ──
     print(f'\n{"="*W}')
-    print("【推奨買い目】")
-    print(f"  2連単: {', '.join(bets['2連単'])}")
-    print(f"  3連単: {', '.join(bets['3連単'][:4])}")
+    print(f"【推奨買い目】  自信度: {bets['自信度']}")
+    print(f"  2連単: {_fmt_bet_list(bets['2連単'])}  [合成{bets['2連単合成']*100:.0f}%]")
+    print(f"  3連単: {_fmt_bet_list(bets['3連単'])}  [合成{bets['3連単合成']*100:.0f}%]")
+    for v in bets.get("妙味", []):
+        print(f"  💰 妙味: {v['艇番']}号艇 単勝{v['オッズ']:.1f}倍（期待値{v['EV']:.2f}）")
     weather_note = (f"（気象補正: 波高{wave}cm・風速{wind}m）"
                     if weather_warns else "（気象補正: 適用なし）")
-    print(f"\n  ※ 11要素スコアリング + 気象補正  {weather_note}")
+    print(f"\n  ※ 13要素スコアリング + 気象補正 + オッズブレンド  {weather_note}")
     print(f'{"="*W}\n')
 
+    # ── 予想ログ記録 ──
+    try:
+        log_prediction(date, race_no, ranked, bets, cond)
+    except Exception as e:
+        print(f"  [警告] 予想ログ記録エラー: {e}")
+
     # ── Discord 送信 ──
-    if args.discord:
-        import os
-        webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
-        if not webhook_url:
-            WEBHOOK_FILE = Path(__file__).parent / "discord_webhook.txt"
-            if WEBHOOK_FILE.exists():
-                webhook_url = WEBHOOK_FILE.read_text(encoding="utf-8-sig").strip()
+    if do_discord:
+        webhook_url = load_webhook_url()
         if not webhook_url:
             print("Discord: webhook URL が見つかりません。")
             print("  discord_webhook.txt を作成するか DISCORD_WEBHOOK_URL 環境変数を設定してください。")
@@ -920,3 +1121,52 @@ if __name__ == "__main__":
             print("Discord に送信中...")
             ok = send_discord(msg, webhook_url)
             print("  送信完了！" if ok else "  送信失敗。")
+
+    return True
+
+
+# ─────────────────────────────────────────────
+#  メイン
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    from datetime import date as _date
+
+    parser = argparse.ArgumentParser(description="ボートレース蒲郡 予想ツール")
+    parser.add_argument("date",    nargs="?", default=None,
+                        help="日付 YYYYMMDD（省略=今日）")
+    parser.add_argument("race_no", nargs="?", type=int, default=None,
+                        help="レース番号 1-12（省略=当日全レース）")
+    parser.add_argument("--all", action="store_true",
+                        help="当日の全レースをまとめて予想")
+    parser.add_argument("--discord", action="store_true", help="結果をDiscordに送信")
+    args = parser.parse_args()
+
+    DATE = args.date or _date.today().strftime("%Y%m%d")
+
+    if args.all or args.race_no is None:
+        # ── 全レース一括予想 ──
+        label = f"{DATE[:4]}/{DATE[4:6]}/{DATE[6:]}"
+        print(f"\nボートレース蒲郡  {label}  全レース一括予想")
+        schedule = fetch_schedule(DATE)
+        race_nos = [r["race_no"] for r in schedule] or list(range(1, 13))
+        if not schedule:
+            print("スケジュール取得失敗。1〜12Rを順に試します。")
+
+        ok_count = 0
+        for rno in race_nos:
+            ok = run_race(DATE, rno, do_discord=args.discord, detail=False)
+            if ok:
+                ok_count += 1
+            elif not schedule:
+                break  # スケジュール不明時はデータの無いレースで打ち切り
+
+        print(f"\n{'='*W}")
+        print(f"全レース予想完了: {ok_count}/{len(race_nos)}レース")
+        if ok_count == 0:
+            print("※ 開催日以外はデータがありません。")
+            sys.exit(1)
+    else:
+        ok = run_race(DATE, args.race_no, do_discord=args.discord, detail=True)
+        if not ok:
+            sys.exit(1)

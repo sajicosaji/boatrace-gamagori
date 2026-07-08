@@ -2,3 +2,4 @@ discord_webhook.txt
 __pycache__/
 *.pyc
 *.pyo
+logs/

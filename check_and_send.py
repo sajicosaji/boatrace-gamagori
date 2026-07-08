@@ -5,62 +5,34 @@ GitHub Actions から呼ばれる1回実行スクリプト。
 例: ahead=10, interval=15 の場合
   → 締切まで10〜25分のレースを送信
   → GitHub Actions で15分おきに実行すれば各レースを1回だけ送信できる
+
+時刻は必ず日本時間（JST）で扱う。GitHub Actions のランナーは UTC のため、
+datetime.now() をそのまま使うと締切と9時間ズレて一切送信されない。
 """
 import os
-import re
 import subprocess
 import sys
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-import requests
-from bs4 import BeautifulSoup
+from gamagori_race import fetch_schedule
 
-VENUE_CODE = "07"
-BASE_URL   = "https://www.boatrace.jp"
-HEADERS    = {"User-Agent": (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)}
-
-
-def get_race_schedule(date_str: str) -> list[dict]:
-    url = f"{BASE_URL}/owpc/pc/race/racelist?hd={date_str}&jcd={VENUE_CODE}&rno=1"
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"スケジュール取得エラー: {e}")
-        return []
-
-    soup  = BeautifulSoup(r.content, "html.parser")
-    races = []
-    for tbl in soup.find_all("table"):
-        rows = tbl.find_all("tr")
-        if len(rows) < 2:
-            continue
-        header = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
-        if header and header[0] == "レース" and "1R" in header:
-            times = [c.get_text(strip=True) for c in rows[1].find_all(["th", "td"])][1:]
-            for i, t in enumerate(times):
-                if re.match(r"\d{1,2}:\d{2}", t):
-                    races.append({"race_no": i + 1, "締切": t})
-            break
-    return races
+JST = ZoneInfo("Asia/Tokyo")
 
 
 def main():
     # GitHub Actions では環境変数で設定
     ahead    = int(os.environ.get("AHEAD_MINUTES", "10"))
     interval = int(os.environ.get("CHECK_INTERVAL", "15"))
-    date_str = date.today().strftime("%Y%m%d")
-    now      = datetime.now()
+    now      = datetime.now(JST)
+    date_str = now.strftime("%Y%m%d")
     script   = Path(__file__).parent / "gamagori_race.py"
 
-    print(f"ボートレース蒲郡  {date_str}  チェック時刻: {now.strftime('%H:%M')}")
+    print(f"ボートレース蒲郡  {date_str}  チェック時刻: {now.strftime('%H:%M')} JST")
     print(f"送信対象: 締切まで {ahead}〜{ahead + interval}分 のレース")
 
-    races = get_race_schedule(date_str)
+    races = fetch_schedule(date_str)
     if not races:
         print("本日の蒲郡開催なし（または取得失敗）")
         return

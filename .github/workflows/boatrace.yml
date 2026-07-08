@@ -2,11 +2,25 @@ name: BoatRace Auto Discord
 
 on:
   schedule:
+    # 予想送信: 15分おき（JST 15:00〜21:45 = UTC 6:00〜12:45）
     - cron: "0,15,30,45 6-12 * * *"
+    # 結果サマリー: 全レース終了後（JST 21:50 = UTC 12:50）
+    - cron: "50 12 * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "実行モード"
+        type: choice
+        options:
+          - predict
+          - results
+        default: predict
 
 jobs:
   send:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule != '50 12 * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'predict')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,3 +40,25 @@ jobs:
           CHECK_INTERVAL: "15"
           PYTHONIOENCODING: "utf-8"
         run: python check_and_send.py
+
+  results:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '50 12 * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'results')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily results summary
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PYTHONIOENCODING: "utf-8"
+        run: python results.py --discord
