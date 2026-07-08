@@ -26,6 +26,10 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# パイプ/リダイレクト先がcp932でも絵文字入り出力で落ちないようにする
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+
 VENUE_CODE = "07"  # 蒲郡
 BASE_URL   = "https://www.boatrace.jp"
 HEADERS    = {
