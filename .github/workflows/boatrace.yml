@@ -2,8 +2,13 @@ name: BoatRace Auto Discord
 
 on:
   schedule:
-    # 予想送信: 15分おき（JST 15:00〜21:45 = UTC 6:00〜12:45）
-    - cron: "0,15,30,45 6-12 * * *"
+    # 予想送信: 待機ループ方式。各実行が最大130分生存して締切10分前に順次送信。
+    # concurrency で直列化し、4本立てで JST 14:30〜21:00 を途切れずカバーする。
+    # （JST = UTC+9。GitHubのcronは遅延・間引きがあるため多めに重ねている）
+    - cron: "30 5 * * *"
+    - cron: "30 7 * * *"
+    - cron: "30 9 * * *"
+    - cron: "30 11 * * *"
     # 結果サマリー: 全レース終了後（JST 21:50 = UTC 12:50）
     - cron: "50 12 * * *"
   workflow_dispatch:
@@ -22,6 +27,10 @@ jobs:
       (github.event_name == 'schedule' && github.event.schedule != '50 12 * * *') ||
       (github.event_name == 'workflow_dispatch' && inputs.mode == 'predict')
     runs-on: ubuntu-latest
+    timeout-minutes: 140
+    concurrency:
+      group: boatrace-send
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -33,11 +42,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run check and send
+      - name: Run check and send (wait-loop)
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           AHEAD_MINUTES: "10"
-          CHECK_INTERVAL: "15"
+          MAX_RUNTIME_MIN: "130"
+          HOT_ONLY: "0"
           PYTHONIOENCODING: "utf-8"
         run: python check_and_send.py
 
@@ -46,6 +56,7 @@ jobs:
       (github.event_name == 'schedule' && github.event.schedule == '50 12 * * *') ||
       (github.event_name == 'workflow_dispatch' && inputs.mode == 'results')
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
