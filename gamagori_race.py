@@ -878,6 +878,11 @@ def _fmt_bet_list(bet_items: list[dict]) -> str:
     return ", ".join(f"{b['組番']}({b['確率']*100:.0f}%)" for b in bet_items)
 
 
+def is_hot_race(bets: dict) -> bool:
+    """「勝負レース」判定: 自信度が鉄板、または市場が過小評価している妙味艇がある"""
+    return bets["自信度"] == "鉄板" or bool(bets.get("妙味"))
+
+
 def _build_discord_msg(ranked: list[dict], conditions: dict,
                        race_label: str, bets: dict) -> str:
     cond  = conditions or {}
@@ -886,7 +891,11 @@ def _build_discord_msg(ranked: list[dict], conditions: dict,
     wave  = cond.get("波高", 0) or 0
     kion  = f"{cond['気温']:.1f}℃" if cond.get("気温") is not None else "---"
 
-    lines = [
+    lines = []
+    if is_hot_race(bets):
+        reason = "鉄板級の本命" if bets["自信度"] == "鉄板" else "妙味あり（市場が過小評価）"
+        lines.append(f"🔥🔥 **勝負レース！**（{reason}）🔥🔥")
+    lines += [
         f"🚤 **【{race_label}】**  自信度: **{bets['自信度']}**",
         f"📍 {tenki}  気温{kion}  風速{wind}m  波高{wave}cm",
         "```",
@@ -966,7 +975,7 @@ def log_prediction(date: str, race_no: int, ranked: list[dict],
 W = 75
 
 def run_race(date: str, race_no: int, do_discord: bool = False,
-             detail: bool = True) -> bool:
+             detail: bool = True, hot_only: bool = False) -> bool:
     race_label = f"ボートレース蒲郡  {date[:4]}/{date[4:6]}/{date[6:]}  {race_no}R"
 
     print(f"\nデータ取得中... {race_label}")
@@ -1116,15 +1125,18 @@ def run_race(date: str, race_no: int, do_discord: bool = False,
 
     # ── Discord 送信 ──
     if do_discord:
-        webhook_url = load_webhook_url()
-        if not webhook_url:
-            print("Discord: webhook URL が見つかりません。")
-            print("  discord_webhook.txt を作成するか DISCORD_WEBHOOK_URL 環境変数を設定してください。")
+        if hot_only and not is_hot_race(bets):
+            print(f"Discord: 勝負レース条件を満たさないため送信スキップ（自信度: {bets['自信度']}）")
         else:
-            msg = _build_discord_msg(ranked, cond, race_label, bets)
-            print("Discord に送信中...")
-            ok = send_discord(msg, webhook_url)
-            print("  送信完了！" if ok else "  送信失敗。")
+            webhook_url = load_webhook_url()
+            if not webhook_url:
+                print("Discord: webhook URL が見つかりません。")
+                print("  discord_webhook.txt を作成するか DISCORD_WEBHOOK_URL 環境変数を設定してください。")
+            else:
+                msg = _build_discord_msg(ranked, cond, race_label, bets)
+                print("Discord に送信中...")
+                ok = send_discord(msg, webhook_url)
+                print("  送信完了！" if ok else "  送信失敗。")
 
     return True
 
@@ -1144,6 +1156,8 @@ if __name__ == "__main__":
     parser.add_argument("--all", action="store_true",
                         help="当日の全レースをまとめて予想")
     parser.add_argument("--discord", action="store_true", help="結果をDiscordに送信")
+    parser.add_argument("--hot-only", action="store_true",
+                        help="勝負レース（鉄板 or 妙味あり）のみDiscordに送信")
     args = parser.parse_args()
 
     DATE = args.date or _date.today().strftime("%Y%m%d")
@@ -1159,7 +1173,8 @@ if __name__ == "__main__":
 
         ok_count = 0
         for rno in race_nos:
-            ok = run_race(DATE, rno, do_discord=args.discord, detail=False)
+            ok = run_race(DATE, rno, do_discord=args.discord, detail=False,
+                          hot_only=args.hot_only)
             if ok:
                 ok_count += 1
             elif not schedule:
@@ -1171,6 +1186,7 @@ if __name__ == "__main__":
             print("※ 開催日以外はデータがありません。")
             sys.exit(1)
     else:
-        ok = run_race(DATE, args.race_no, do_discord=args.discord, detail=True)
+        ok = run_race(DATE, args.race_no, do_discord=args.discord, detail=True,
+                      hot_only=args.hot_only)
         if not ok:
             sys.exit(1)
