@@ -52,8 +52,10 @@ def main():
         send_at   = deadline - timedelta(minutes=ahead)
         now       = datetime.now(JST)
 
-        if send_at < now - timedelta(minutes=2):
-            continue  # 送信時刻を過ぎている（前の実行が担当済み or 取りこぼし）
+        if send_at <= now:
+            # 送信時刻を過ぎたレースは扱わない。
+            # （猶予を持たせると、直列実行の次の回が同じレースを再送してしまう）
+            continue
         if send_at > end:
             print(f"  {race['race_no']}R (締切{race['締切']}) は稼働時間外 → 次の実行に任せる")
             break
