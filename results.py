@@ -27,6 +27,7 @@ JST = ZoneInfo("Asia/Tokyo")
 from gamagori_race import (
     BASE_URL, VENUE_CODE, FW2HW,
     _fetch, fetch_schedule, get_race_data, predict, recommend_bets,
+    fetch_odds_exacta, fetch_odds_trifecta, is_hot_race,
     load_webhook_url, send_discord,
 )
 
@@ -152,7 +153,9 @@ def evaluate_race(date: str, race_no: int, quiet: bool = True) -> dict | None:
         return None
 
     ranked = predict(boats, conditions)
-    bets   = recommend_bets(ranked)
+    bets   = recommend_bets(ranked,
+                            fetch_odds_exacta(date, race_no),
+                            fetch_odds_trifecta(date, race_no))
 
     finish  = result["着順"]
     winner  = finish[0] if finish else None
@@ -177,6 +180,7 @@ def evaluate_race(date: str, race_no: int, quiet: bool = True) -> dict | None:
     return {
         "レース":    race_no,
         "自信度":    bets["自信度"],
+        "勝負":      is_hot_race(bets),
         "本命":      ranked[0]["艇番"],
         "予想順":    [r["艇番"] for r in ranked],
         "着順":      finish,
@@ -215,9 +219,11 @@ def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | N
         return None
 
     n        = len(evals)
+    bet_ev   = [e for e in evals if e["勝負"]]
+    nb       = len(bet_ev)
     win_n    = sum(1 for e in evals if e["本命的中"])
-    ex_n     = sum(1 for e in evals if e["2連単的中"])
-    tri_n    = sum(1 for e in evals if e["3連単的中"])
+    ex_n     = sum(1 for e in bet_ev if e["2連単的中"])
+    tri_n    = sum(1 for e in bet_ev if e["3連単的中"])
     ex_cost  = sum(e["2連単収支"][0] for e in evals)
     ex_ret   = sum(e["2連単収支"][1] for e in evals)
     tri_cost = sum(e["3連単収支"][0] for e in evals)
@@ -227,11 +233,11 @@ def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | N
         return ret / cost * 100 if cost else 0.0
 
     lines = [
-        f"📊 **【蒲郡 {label} 結果検証】** ({n}レース)",
+        f"📊 **【蒲郡 {label} 結果検証】** ({n}レース / 🔥勝負{nb} / 見送り{n-nb})",
         "```",
         f"◎1着的中 : {win_n}/{n}  ({win_n/n*100:.0f}%)",
-        f"2連単的中: {ex_n}/{n}  回収率 {roi(ex_ret, ex_cost):.0f}%  ({ex_ret:,}円/{ex_cost:,}円)",
-        f"3連単的中: {tri_n}/{n}  回収率 {roi(tri_ret, tri_cost):.0f}%  ({tri_ret:,}円/{tri_cost:,}円)",
+        f"2連単的中: {ex_n}回  回収率 {roi(ex_ret, ex_cost):.0f}%  ({ex_ret:,}円/{ex_cost:,}円)",
+        f"3連単的中: {tri_n}回  回収率 {roi(tri_ret, tri_cost):.0f}%  ({tri_ret:,}円/{tri_cost:,}円)",
         f"合計収支 : {'+' if ex_ret+tri_ret >= ex_cost+tri_cost else ''}{ex_ret+tri_ret-ex_cost-tri_cost:,}円"
         f"  (回収率 {roi(ex_ret+tri_ret, ex_cost+tri_cost):.0f}%)",
         "```",
@@ -239,15 +245,17 @@ def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | N
 
     hit_lines = []
     for e in evals:
+        finish_s = "-".join(map(str, e["着順"][:3]))
+        if not e["勝負"]:
+            hit_lines.append(f"　 {e['レース']:2d}R [見送り] 結果{finish_s}")
+            continue
         marks = []
-        if e["本命的中"]:  marks.append("◎")
         if e["2連単的中"]: marks.append(f"2単¥{e['2連単収支'][1]:,}")
         if e["3連単的中"]: marks.append(f"3単¥{e['3連単収支'][1]:,}")
-        finish_s = "-".join(map(str, e["着順"][:3]))
         if marks:
-            hit_lines.append(f"🎯 {e['レース']:2d}R [{e['自信度']}] 結果{finish_s}  {' / '.join(marks)}")
+            hit_lines.append(f"🎯 {e['レース']:2d}R [🔥{e['自信度']}] 結果{finish_s}  {' / '.join(marks)}")
         else:
-            hit_lines.append(f"　 {e['レース']:2d}R [{e['自信度']}] 結果{finish_s}  本命{e['本命']}号艇")
+            hit_lines.append(f"❌ {e['レース']:2d}R [🔥{e['自信度']}] 結果{finish_s}  外れ")
     lines.extend(hit_lines)
 
     return evals, "\n".join(lines)

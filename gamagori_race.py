@@ -341,6 +341,79 @@ def fetch_beforeinfo(date: str, race_no: int) -> tuple[dict[int, dict], dict]:
     return result, conditions
 
 
+def fetch_odds_exacta(date: str, race_no: int) -> dict[str, float]:
+    """
+    2連単の全30通りのオッズを取得。{"1-2": 9.5, ...}
+    ページ構造: 6列（1着艇ごと）× 5行、各セルは (2着艇, オッズ) のペア。
+    """
+    url = (f"{BASE_URL}/owpc/pc/race/odds2tf"
+           f"?hd={date}&jcd={VENUE_CODE}&rno={race_no}")
+    try:
+        soup = _fetch(url)
+    except Exception:
+        return {}
+    odds: dict[str, float] = {}
+    for t in soup.find_all("table"):
+        rows = t.find_all("tr")
+        if len(rows) != 6:
+            continue
+        ok = True
+        for row in rows[1:]:
+            cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"])]
+            if len(cells) != 12:
+                ok = False
+                break
+            for k in range(6):
+                sec_s, odd_s = cells[2 * k], cells[2 * k + 1]
+                v = _num(odd_s)
+                if sec_s.isdigit() and v is not None:
+                    odds[f"{k + 1}-{sec_s}"] = v
+        if ok and len(odds) >= 25:
+            break
+        odds = {}
+    return odds
+
+
+def fetch_odds_trifecta(date: str, race_no: int) -> dict[str, float]:
+    """
+    3連単の全120通りのオッズを取得。{"1-2-3": 13.5, ...}
+    ページ構造: 6列（1着艇ごと）× 20行。2着ブロックの先頭行は
+    (2着, 3着, オッズ) の3つ組×6列、続く行は (3着, オッズ) のペア×6列。
+    """
+    url = (f"{BASE_URL}/owpc/pc/race/odds3t"
+           f"?hd={date}&jcd={VENUE_CODE}&rno={race_no}")
+    try:
+        soup = _fetch(url)
+    except Exception:
+        return {}
+    odds: dict[str, float] = {}
+    for t in soup.find_all("table"):
+        rows = t.find_all("tr")
+        if len(rows) != 21:
+            continue
+        seconds = [None] * 6
+        for row in rows[1:]:
+            cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"])]
+            if len(cells) == 18:      # 新しい2着ブロックの先頭行
+                for k in range(6):
+                    sec_s, thr_s, odd_s = cells[3 * k], cells[3 * k + 1], cells[3 * k + 2]
+                    v = _num(odd_s)
+                    if sec_s.isdigit():
+                        seconds[k] = sec_s
+                    if sec_s.isdigit() and thr_s.isdigit() and v is not None:
+                        odds[f"{k + 1}-{sec_s}-{thr_s}"] = v
+            elif len(cells) == 12:    # 同じ2着ブロックの続き
+                for k in range(6):
+                    thr_s, odd_s = cells[2 * k], cells[2 * k + 1]
+                    v = _num(odd_s)
+                    if seconds[k] and thr_s.isdigit() and v is not None:
+                        odds[f"{k + 1}-{seconds[k]}-{thr_s}"] = v
+        if len(odds) >= 100:
+            break
+        odds = {}
+    return odds
+
+
 def fetch_odds_win(date: str, race_no: int) -> dict[int, float]:
     """単勝オッズを取得。{艇番: オッズ倍率} を返す。取得失敗時は空dict。"""
     url = (f"{BASE_URL}/owpc/pc/race/oddstf"
@@ -747,47 +820,114 @@ def _pl_trifecta(p: dict[int, float]) -> dict[str, float]:
     return out
 
 
-def recommend_bets(ranked: list[dict]) -> dict:
+# 期待値ベース買い目の選定パラメータ
+# 11日間・132レースのバックテストで決定（2026/07/01-06, 07/13-17）。
+# モデル確率と市場（オッズ逆数）確率をブレンドし、乖離が大きい組番だけを買う。
+#   2連単: レース選別役。この条件を満たすレースだけが「勝負レース」になる
+#          （バックテスト: 33/132レース選出、回収率122%、両節プラス）
+#   3連単: 勝負レースにだけ添える穴目（同: 回収率414%、ただし高分散）
+W_MODEL_EX     = 0.6    # 2連単: モデル確率の比率（残りは市場確率）
+EV_MIN_EX      = 1.1    # 2連単: 期待値下限
+P_MIN_EX       = 0.08   # 2連単: ブレンド確率下限
+MAX_BETS_EX    = 2      # 2連単: 最大点数
+W_MODEL_TRI    = 0.4    # 3連単: モデル確率の比率
+EV_MIN_TRI     = 1.3    # 3連単: 期待値下限
+P_MIN_TRI      = 0.01   # 3連単: ブレンド確率下限
+MAX_BETS_TRI   = 2      # 3連単: 最大点数
+COMPOSITE_MIN  = 5.0    # 買い目セットの合成オッズの下限
+
+
+def _composite_odds(bets: list[dict]) -> float:
+    """合成オッズ = 1 / Σ(1/各オッズ)。全部買って当たった時の実質倍率。"""
+    inv = sum(1.0 / b["オッズ"] for b in bets if b.get("オッズ"))
+    return 1.0 / inv if inv > 0 else 0.0
+
+
+def _market_probs(odds: dict[str, float]) -> dict[str, float]:
+    """オッズの逆数を正規化して市場の含意確率にする（控除率の影響を除去）"""
+    inv = {c: 1.0 / o for c, o in odds.items() if o and o > 0}
+    s = sum(inv.values())
+    return {c: v / s for c, v in inv.items()} if s > 0 else {}
+
+
+def _select_ev_bets(probs: dict[str, float], odds: dict[str, float],
+                    w_model: float, ev_min: float, p_min: float,
+                    max_bets: int) -> list[dict]:
     """
-    自信度に応じて買い目点数を可変にする。
-    蒲郡は1コースの基礎勝率が55%と高いため、閾値は高めに設定。
-      鉄板（◎勝率58%以上）: 2連単2点 / 3連単4点  … 厚く少点数
-      有力（46%以上）      : 2連単3点 / 3連単5点
-      接戦（36%以上）      : 2連単3点 / 3連単6点
-      混戦（36%未満）      : 2連単4点 / 3連単7点  … 広く薄く
-    妙味: モデル勝率 × 単勝オッズ（期待値）が1.2以上の艇を「市場が過小評価」として提示。
+    ブレンド確率（モデル×市場）で期待値の高い組番を選ぶ。
+      条件: ブレンドEV >= ev_min かつ ブレンド確率 >= p_min
+      合成オッズが COMPOSITE_MIN を下回らない範囲で EV 順に最大 max_bets 点
+    """
+    market = _market_probs(odds)
+    cands = []
+    for combo, pm in probs.items():
+        o = odds.get(combo)
+        if not o or o <= 1.0:
+            continue
+        pb = w_model * pm + (1 - w_model) * market.get(combo, 0.0)
+        if pb >= p_min and pb * o >= ev_min:
+            cands.append({"組番": combo, "確率": pb, "オッズ": o,
+                          "EV": round(pb * o, 2)})
+    cands.sort(key=lambda x: -x["EV"])
+
+    chosen: list[dict] = []
+    for c in cands:
+        if len(chosen) >= max_bets:
+            break
+        if _composite_odds(chosen + [c]) >= COMPOSITE_MIN:
+            chosen.append(c)
+    return chosen
+
+
+def recommend_bets(ranked: list[dict],
+                   exacta_odds: dict[str, float] | None = None,
+                   trifecta_odds: dict[str, float] | None = None) -> dict:
+    """
+    期待値ベースの買い目選定（バックテスト済み設定）。
+    ① 2連単の選別条件を満たすレースだけを「勝負レース」とする
+    ② 勝負レースにだけ、3連単の穴目（市場が過小評価している組番）を最大2点添える
+    ③ どちらも合成オッズ5倍以上を維持できる範囲で点数を絞る
+    組番オッズが取得できない場合は従来の確率順（参考表示）にフォールバック。
     """
     p  = {r["艇番"]: r["予想勝率"] for r in ranked}
     p1 = ranked[0]["予想勝率"]
 
     if p1 >= 0.58:
-        conf, n2, n3 = "鉄板", 2, 4
+        conf = "鉄板"
     elif p1 >= 0.46:
-        conf, n2, n3 = "有力", 3, 5
+        conf = "有力"
     elif p1 >= 0.36:
-        conf, n2, n3 = "接戦", 3, 6
+        conf = "接戦"
     else:
-        conf, n2, n3 = "混戦", 4, 7
+        conf = "混戦"
 
-    ex  = sorted(_pl_exacta(p).items(),   key=lambda kv: -kv[1])[:n2]
-    tri = sorted(_pl_trifecta(p).items(), key=lambda kv: -kv[1])[:n3]
+    ex_probs  = _pl_exacta(p)
+    tri_probs = _pl_trifecta(p)
 
-    value = []
-    for r in ranked:
-        odds = r.get("単勝オッズ")
-        mp   = r.get("モデル勝率")
-        if odds and mp and mp >= 0.10:
-            ev = mp * odds
-            if ev >= 1.2:
-                value.append({"艇番": r["艇番"], "EV": round(ev, 2), "オッズ": odds})
+    if exacta_odds or trifecta_odds:
+        ex_bets = _select_ev_bets(ex_probs, exacta_odds or {},
+                                  W_MODEL_EX, EV_MIN_EX, P_MIN_EX, MAX_BETS_EX)
+        # 3連単は勝負レース（2連単条件を満たす）にだけ添える
+        tri_bets = []
+        if ex_bets:
+            tri_bets = _select_ev_bets(tri_probs, trifecta_odds or {},
+                                       W_MODEL_TRI, EV_MIN_TRI, P_MIN_TRI,
+                                       MAX_BETS_TRI)
+        mode = "EV"
+    else:
+        ex_bets  = [{"組番": c, "確率": pr}
+                    for c, pr in sorted(ex_probs.items(),  key=lambda kv: -kv[1])[:3]]
+        tri_bets = [{"組番": c, "確率": pr}
+                    for c, pr in sorted(tri_probs.items(), key=lambda kv: -kv[1])[:5]]
+        mode = "確率"
 
     return {
+        "方式":     mode,
         "自信度":   conf,
-        "2連単":    [{"組番": c, "確率": pr} for c, pr in ex],
-        "3連単":    [{"組番": c, "確率": pr} for c, pr in tri],
-        "2連単合成": sum(pr for _, pr in ex),
-        "3連単合成": sum(pr for _, pr in tri),
-        "妙味":     value,
+        "2連単":    ex_bets,
+        "3連単":    tri_bets,
+        "2連単合成": _composite_odds(ex_bets)  if mode == "EV" else 0.0,
+        "3連単合成": _composite_odds(tri_bets) if mode == "EV" else 0.0,
     }
 
 
@@ -875,12 +1015,26 @@ def _boat_reason(b: dict, boats: list[dict], conditions: dict) -> list[str]:
 
 
 def _fmt_bet_list(bet_items: list[dict]) -> str:
-    return ", ".join(f"{b['組番']}({b['確率']*100:.0f}%)" for b in bet_items)
+    if not bet_items:
+        return "なし（期待値プラスの組番がない）"
+    parts = []
+    for b in bet_items:
+        if "EV" in b:
+            parts.append(f"{b['組番']}({b['オッズ']:.1f}倍/EV{b['EV']:.2f})")
+        else:
+            parts.append(f"{b['組番']}({b['確率']*100:.0f}%)")
+    return ", ".join(parts)
 
 
 def is_hot_race(bets: dict) -> bool:
-    """「勝負レース」判定: 自信度が鉄板、または市場が過小評価している妙味艇がある"""
-    return bets["自信度"] == "鉄板" or bool(bets.get("妙味"))
+    """
+    「勝負レース」判定:
+      EV方式  → 期待値プラス（EV>=1.2 かつ 合成5倍以上）の買い目が存在するレース
+      確率方式→ オッズ未取得時のフォールバック。鉄板のみ
+    """
+    if bets.get("方式") == "EV":
+        return bool(bets["2連単"] or bets["3連単"])
+    return bets["自信度"] == "鉄板"
 
 
 def _build_discord_msg(ranked: list[dict], conditions: dict,
@@ -893,7 +1047,11 @@ def _build_discord_msg(ranked: list[dict], conditions: dict,
 
     lines = []
     if is_hot_race(bets):
-        reason = "鉄板級の本命" if bets["自信度"] == "鉄板" else "妙味あり（市場が過小評価）"
+        if bets.get("方式") == "EV":
+            n = len(bets["2連単"]) + len(bets["3連単"])
+            reason = f"期待値プラスの買い目 {n}点"
+        else:
+            reason = "鉄板級の本命"
         lines.append(f"🔥🔥 **勝負レース！**（{reason}）🔥🔥")
     lines += [
         f"🚤 **【{race_label}】**  自信度: **{bets['自信度']}**",
@@ -928,10 +1086,14 @@ def _build_discord_msg(ranked: list[dict], conditions: dict,
         lines.append("")
 
     lines.append("```")
-    lines.append(f"📌 2連単: {_fmt_bet_list(bets['2連単'])}")
-    lines.append(f"📌 3連単: {_fmt_bet_list(bets['3連単'])}  [合成{bets['3連単合成']*100:.0f}%]")
-    for v in bets.get("妙味", []):
-        lines.append(f"💰 妙味: {v['艇番']}号艇 単勝{v['オッズ']:.1f}倍（期待値{v['EV']:.2f}）")
+    if bets.get("方式") == "EV":
+        g2 = f"  [合成{bets['2連単合成']:.1f}倍]" if bets["2連単"] else ""
+        g3 = f"  [合成{bets['3連単合成']:.1f}倍]" if bets["3連単"] else ""
+        lines.append(f"📌 2連単: {_fmt_bet_list(bets['2連単'])}{g2}")
+        lines.append(f"📌 3連単: {_fmt_bet_list(bets['3連単'])}{g3}")
+    else:
+        lines.append(f"📌 2連単(参考): {_fmt_bet_list(bets['2連単'])}")
+        lines.append(f"📌 3連単(参考): {_fmt_bet_list(bets['3連単'])}")
     return "\n".join(lines)
 
 
@@ -1007,7 +1169,15 @@ def run_race(date: str, race_no: int, do_discord: bool = False,
         weather_warns.append(f"風速{wind}m（強め）→ 全艇展示タイム信頼度 70%")
 
     ranked = predict(data, conditions)
-    bets   = recommend_bets(ranked)
+
+    print("  2連単・3連単オッズを取得中...", end="", flush=True)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_ex  = ex.submit(fetch_odds_exacta,   date, race_no)
+        f_tri = ex.submit(fetch_odds_trifecta, date, race_no)
+    exacta_odds, trifecta_odds = f_ex.result(), f_tri.result()
+    print(f" OK（2連単{len(exacta_odds)}件 / 3連単{len(trifecta_odds)}件）")
+
+    bets = recommend_bets(ranked, exacta_odds, trifecta_odds)
 
     # ── サマリーヘッダー ──
     print(f'\n{"="*W}')
@@ -1107,14 +1277,20 @@ def run_race(date: str, race_no: int, do_discord: bool = False,
 
     # ── 推奨買い目 ──
     print(f'\n{"="*W}')
-    print(f"【推奨買い目】  自信度: {bets['自信度']}")
-    print(f"  2連単: {_fmt_bet_list(bets['2連単'])}  [合成{bets['2連単合成']*100:.0f}%]")
-    print(f"  3連単: {_fmt_bet_list(bets['3連単'])}  [合成{bets['3連単合成']*100:.0f}%]")
-    for v in bets.get("妙味", []):
-        print(f"  💰 妙味: {v['艇番']}号艇 単勝{v['オッズ']:.1f}倍（期待値{v['EV']:.2f}）")
+    if bets["方式"] == "EV":
+        hot_s = "🔥勝負レース" if is_hot_race(bets) else "見送り推奨（期待値プラスの組番なし）"
+        print(f"【推奨買い目（期待値ベース）】  自信度: {bets['自信度']}  {hot_s}")
+        g2 = f"  [合成{bets['2連単合成']:.1f}倍]" if bets["2連単"] else ""
+        g3 = f"  [合成{bets['3連単合成']:.1f}倍]" if bets["3連単"] else ""
+        print(f"  2連単: {_fmt_bet_list(bets['2連単'])}{g2}")
+        print(f"  3連単: {_fmt_bet_list(bets['3連単'])}{g3}")
+    else:
+        print(f"【推奨買い目（確率順・参考）】  自信度: {bets['自信度']}  ※オッズ未取得")
+        print(f"  2連単: {_fmt_bet_list(bets['2連単'])}")
+        print(f"  3連単: {_fmt_bet_list(bets['3連単'])}")
     weather_note = (f"（気象補正: 波高{wave}cm・風速{wind}m）"
                     if weather_warns else "（気象補正: 適用なし）")
-    print(f"\n  ※ 13要素スコアリング + 気象補正 + オッズブレンド  {weather_note}")
+    print(f"\n  ※ 13要素スコアリング + 気象補正 + 市場ブレンドEV選定(合成≥{COMPOSITE_MIN}倍)  {weather_note}")
     print(f'{"="*W}\n')
 
     # ── 予想ログ記録 ──
