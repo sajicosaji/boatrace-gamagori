@@ -28,7 +28,7 @@ from gamagori_race import (
     BASE_URL, VENUE_CODE, FW2HW,
     _fetch, fetch_schedule, get_race_data, predict, recommend_bets,
     fetch_odds_exacta, fetch_odds_trifecta, is_hot_race,
-    load_webhook_url, send_discord,
+    load_prediction_log, load_webhook_url, send_discord,
 )
 
 FW_RANK = {"１": 1, "２": 2, "３": 3, "４": 4, "５": 5, "６": 6}
@@ -138,8 +138,54 @@ def fetch_race_result(date: str, race_no: int) -> dict | None:
 #  1レースの照合
 # ─────────────────────────────────────────────
 
+def _evaluate_common(result: dict, race_no: int, conf, hot: bool,
+                     honmei, yosou_jun: list,
+                     ex_bets: list[str], tri_bets: list[str]) -> dict:
+    """着順・払戻と買い目リストを突き合わせて収支を出す共通部"""
+    finish  = result["着順"]
+    winner  = finish[0] if finish else None
+    ex_hit_combo  = f"{finish[0]}-{finish[1]}" if len(finish) >= 2 else None
+    tri_hit_combo = f"{finish[0]}-{finish[1]}-{finish[2]}" if len(finish) >= 3 else None
+
+    ex_hit  = ex_hit_combo in ex_bets if ex_hit_combo else False
+    tri_hit = tri_hit_combo in tri_bets if tri_hit_combo else False
+
+    pay_ex  = result["払戻金"].get("2連単", {})
+    pay_tri = result["払戻金"].get("3連単", {})
+
+    return {
+        "レース":    race_no,
+        "自信度":    conf,
+        "勝負":      hot,
+        "本命":      honmei,
+        "予想順":    yosou_jun,
+        "着順":      finish,
+        "決まり手":  result["決まり手"],
+        "本命的中":  honmei == winner if honmei else False,
+        "2連単的中": ex_hit,
+        "3連単的中": tri_hit,
+        "2連単買い目": ex_bets,
+        "3連単買い目": tri_bets,
+        "2連単収支": (100 * len(ex_bets), pay_ex.get(ex_hit_combo, 0) if ex_hit else 0),
+        "3連単収支": (100 * len(tri_bets), pay_tri.get(tri_hit_combo, 0) if tri_hit else 0),
+    }
+
+
+def evaluate_race_from_log(date: str, race_no: int, rec: dict) -> dict | None:
+    """送信記録（実際に配信した買い目）と結果を照合する。追加の予想計算はしない"""
+    result = fetch_race_result(date, race_no)
+    if result is None:
+        return None
+    hot = bool(rec.get("送信"))  # 実際に配信したレースだけを「勝負」扱いにする
+    ex_bets  = [b["組番"] for b in rec.get("2連単", [])] if hot else []
+    tri_bets = [b["組番"] for b in rec.get("3連単", [])] if hot else []
+    yosou = rec.get("予想順", [])
+    return _evaluate_common(result, race_no, rec.get("自信度"), hot,
+                            yosou[0] if yosou else None, yosou, ex_bets, tri_bets)
+
+
 def evaluate_race(date: str, race_no: int, quiet: bool = True) -> dict | None:
-    """予想を再計算し、結果と照合して的中・収支を返す"""
+    """予想を再計算し、結果と照合して的中・収支を返す（記録が無い日の検証用）"""
     result = fetch_race_result(date, race_no)
     if result is None:
         return None
@@ -157,42 +203,10 @@ def evaluate_race(date: str, race_no: int, quiet: bool = True) -> dict | None:
                             fetch_odds_exacta(date, race_no),
                             fetch_odds_trifecta(date, race_no))
 
-    finish  = result["着順"]
-    winner  = finish[0] if finish else None
-    ex_hit_combo  = f"{finish[0]}-{finish[1]}" if len(finish) >= 2 else None
-    tri_hit_combo = f"{finish[0]}-{finish[1]}-{finish[2]}" if len(finish) >= 3 else None
-
-    ex_bets  = [b["組番"] for b in bets["2連単"]]
-    tri_bets = [b["組番"] for b in bets["3連単"]]
-
-    ex_hit  = ex_hit_combo in ex_bets if ex_hit_combo else False
-    tri_hit = tri_hit_combo in tri_bets if tri_hit_combo else False
-    win_hit = ranked[0]["艇番"] == winner
-
-    pay_ex  = result["払戻金"].get("2連単", {})
-    pay_tri = result["払戻金"].get("3連単", {})
-
-    ex_cost    = 100 * len(ex_bets)
-    tri_cost   = 100 * len(tri_bets)
-    ex_return  = pay_ex.get(ex_hit_combo, 0) if ex_hit else 0
-    tri_return = pay_tri.get(tri_hit_combo, 0) if tri_hit else 0
-
-    return {
-        "レース":    race_no,
-        "自信度":    bets["自信度"],
-        "勝負":      is_hot_race(bets),
-        "本命":      ranked[0]["艇番"],
-        "予想順":    [r["艇番"] for r in ranked],
-        "着順":      finish,
-        "決まり手":  result["決まり手"],
-        "本命的中":  win_hit,
-        "2連単的中": ex_hit,
-        "3連単的中": tri_hit,
-        "2連単買い目": ex_bets,
-        "3連単買い目": tri_bets,
-        "2連単収支": (ex_cost, ex_return),
-        "3連単収支": (tri_cost, tri_return),
-    }
+    return _evaluate_common(result, race_no, bets["自信度"], is_hot_race(bets),
+                            ranked[0]["艇番"], [r["艇番"] for r in ranked],
+                            [b["組番"] for b in bets["2連単"]],
+                            [b["組番"] for b in bets["3連単"]])
 
 
 # ─────────────────────────────────────────────
@@ -200,16 +214,37 @@ def evaluate_race(date: str, race_no: int, quiet: bool = True) -> dict | None:
 # ─────────────────────────────────────────────
 
 def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | None:
-    """当日全レースを照合し、(各レース結果, サマリー文字列) を返す"""
+    """
+    当日全レースを照合し、(各レース結果, サマリー文字列) を返す。
+    送信記録（sent/ または logs/ の predictions_日付.jsonl）があれば
+    「実際に配信した買い目」と答え合わせし、無ければ予想を再計算して検証する。
+    """
     label = f"{date[:4]}/{date[4:6]}/{date[6:]}"
     schedule = fetch_schedule(date)
     race_nos = [r["race_no"] for r in schedule] or list(range(1, 13))
+
+    log = load_prediction_log(date)
+    # 実際に配信した記録が1件も無い日は、ローカルのお試し実行記録に引きずられず再計算検証する
+    if log and not any(r.get("送信") for r in log.values()):
+        log = {}
+    if verbose and log:
+        print(f"  送信記録 {len(log)}レース分を使用（実配信ベースの検証）")
 
     evals = []
     for rno in race_nos:
         if verbose:
             print(f"  {rno}R を検証中...", flush=True)
-        ev = evaluate_race(date, rno)
+        if log:
+            rec = log.get(rno)
+            if rec:
+                ev = evaluate_race_from_log(date, rno, rec)
+            else:
+                # 記録が無いレース（稼働の谷間など）は結果だけ載せる
+                result = fetch_race_result(date, rno)
+                ev = (_evaluate_common(result, rno, None, False, None, [], [], [])
+                      if result else None)
+        else:
+            ev = evaluate_race(date, rno)
         if ev:
             evals.append(ev)
         elif not schedule:
@@ -221,7 +256,9 @@ def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | N
     n        = len(evals)
     bet_ev   = [e for e in evals if e["勝負"]]
     nb       = len(bet_ev)
-    win_n    = sum(1 for e in evals if e["本命的中"])
+    pred_ev  = [e for e in evals if e["本命"] is not None]
+    np_      = max(len(pred_ev), 1)
+    win_n    = sum(1 for e in pred_ev if e["本命的中"])
     ex_n     = sum(1 for e in bet_ev if e["2連単的中"])
     tri_n    = sum(1 for e in bet_ev if e["3連単的中"])
     ex_cost  = sum(e["2連単収支"][0] for e in evals)
@@ -235,7 +272,7 @@ def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | N
     lines = [
         f"📊 **【蒲郡 {label} 結果検証】** ({n}レース / 🔥勝負{nb} / 見送り{n-nb})",
         "```",
-        f"◎1着的中 : {win_n}/{n}  ({win_n/n*100:.0f}%)",
+        f"◎1着的中 : {win_n}/{len(pred_ev)}  ({win_n/np_*100:.0f}%)",
         f"2連単的中: {ex_n}回  回収率 {roi(ex_ret, ex_cost):.0f}%  ({ex_ret:,}円/{ex_cost:,}円)",
         f"3連単的中: {tri_n}回  回収率 {roi(tri_ret, tri_cost):.0f}%  ({tri_ret:,}円/{tri_cost:,}円)",
         f"合計収支 : {'+' if ex_ret+tri_ret >= ex_cost+tri_cost else ''}{ex_ret+tri_ret-ex_cost-tri_cost:,}円"
@@ -246,16 +283,19 @@ def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | N
     hit_lines = []
     for e in evals:
         finish_s = "-".join(map(str, e["着順"][:3]))
+        conf_s = f"{e['自信度']}/5" if isinstance(e["自信度"], int) else "-"
         if not e["勝負"]:
             hit_lines.append(f"　 {e['レース']:2d}R [見送り] 結果{finish_s}")
             continue
+        cost = e["2連単収支"][0] + e["3連単収支"][0]
+        gain = e["2連単収支"][1] + e["3連単収支"][1]
         marks = []
         if e["2連単的中"]: marks.append(f"2単¥{e['2連単収支'][1]:,}")
         if e["3連単的中"]: marks.append(f"3単¥{e['3連単収支'][1]:,}")
         if marks:
-            hit_lines.append(f"🎯 {e['レース']:2d}R [🔥{e['自信度']}] 結果{finish_s}  {' / '.join(marks)}")
+            hit_lines.append(f"🎯 {e['レース']:2d}R [🔥{conf_s}] 結果{finish_s}  {' / '.join(marks)}  ({gain-cost:+,}円)")
         else:
-            hit_lines.append(f"❌ {e['レース']:2d}R [🔥{e['自信度']}] 結果{finish_s}  外れ")
+            hit_lines.append(f"❌ {e['レース']:2d}R [🔥{conf_s}] 結果{finish_s}  外れ ({-cost:,}円)")
     lines.extend(hit_lines)
 
     return evals, "\n".join(lines)

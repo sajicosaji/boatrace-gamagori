@@ -21,6 +21,9 @@ on:
           - results
         default: predict
 
+permissions:
+  contents: write
+
 jobs:
   send:
     if: >-
@@ -47,10 +50,24 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           AHEAD_MINUTES: "10"
           MAX_RUNTIME_MIN: "130"
-          # 勝負レース（鉄板 or 妙味あり）だけDiscordに送信する
+          # 勝負レース（期待値プラスの買い目があるレース）だけDiscordに送信する
           HOT_ONLY: "1"
+          # 送信記録を sent/ に書き、コミットして夜の結果検証と共有する
+          PREDICTION_LOG_DIR: "sent"
           PYTHONIOENCODING: "utf-8"
         run: python check_and_send.py
+
+      - name: Commit sent log
+        if: always()
+        run: |
+          git config user.name "boatrace-bot"
+          git config user.email "boatrace-bot@users.noreply.github.com"
+          git add sent/ 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "log: sent predictions"
+            git pull --rebase origin master || true
+            git push origin HEAD:master || echo "push failed (non-fatal)"
+          fi
 
   results:
     if: >-
