@@ -339,8 +339,9 @@ def main():
         print(summary)
 
     if not all_evals:
-        print("\n検証できたレースがありません。")
-        sys.exit(1)
+        # 非開催日は正常な結果なので異常終了にはしない（Actionsで無駄に failure 表示にならないように）
+        print("\n検証できたレースがありません（非開催日、または結果未確定）。")
+        return
 
     # 期間合計（複数日のとき）
     if len(summaries) > 1:
