@@ -7,13 +7,15 @@
   /back3     : 直近3節の着順
   /season    : 現在期（約半年）の総合成績
 
-予想: 13要素スコアリング + 気象補正 + 市場オッズブレンド
-買い目: Plackett-Luce モデルで 2連単/3連単 の的中確率を計算し、
+予想: Plackett-Luce対数オッズモデル（実データMLE適合、14特徴量+コース番号）
+      + 気象補正 + 市場オッズブレンド
+買い目: 予想勝率から2連単/3連単の的中確率を計算し、
         レースの自信度（5段階評定、5が最高）と期待値で買い目を選定する。
 """
 
 import argparse
 import json
+import math
 import re
 import statistics
 import sys
@@ -637,60 +639,58 @@ def get_race_data(date: str, race_no: int, quiet: bool = False) -> tuple[list[di
 
 
 # ─────────────────────────────────────────────
-#  予想ロジック
+#  予想ロジック（対数オッズ加法モデル / Plackett-Luce）
 # ─────────────────────────────────────────────
+#
+# 旧方式は「1コース基礎勝率55% × (1+微小補正)」という乗算構造だったため、
+# 補正項がどれだけ強くても1号艇の6.5倍という基礎有利を覆せず、◎が常に
+# 1号艇になる（=2〜6号艇の頭を拾えない）という構造的な欠陥があった。
+# 新方式は全要素を対数オッズ（強さの対数）に加法的に積み上げる
+# Plackett-Luceモデルとし、コース番号も他の要素と対等な1入力として
+# 実データから最尤推定（MLE, L2正則化）した係数を使う。これにより、
+# その日のモーター・展示等が強く示せば2〜6号艇が◎になり得る。
+#
+# 係数は 2026-08-27 に蒲郡の過去約7ヶ月・124開催日・1330レースの実データで
+# 最尤推定（L2正則化 λ=3.0、温度較正T=1.06）。
+# 時系列で train(798)/val(266)/test(266) に3分割し、テスト期間
+# （2026/06/28〜08/24、学習に一切使用していない直近2ヶ月）で
+# 旧方式（1コース基礎55%×乗算補正）と比較検証済み:
+#   ◎艇番分布   旧: 1号艇100%           → 新: 1号艇71% / 2号艇10% / 3号艇7%
+#                                          / 4号艇5% / 5号艇4% / 6号艇3%
+#   ◎的中率     旧: 54.9%               → 新: 57.1%
+#   平均log損失  旧: 1.3326               → 新: 1.2646（低いほど良い）
+#   EV買い目回収率 旧: 56%（収支-19,180円）→ 新: 128%（収支+4,150円）
+# 上記の係数は検証用（train+val学習）。実運用の係数は全1330レースで
+# 再学習（fit_pl_model.py / fit_final.py、開発用スクリプト・リポジトリ外）。
 
-# スコアリングの重み（2026-07-19 に12日間・144レースで再調整。
-# モーター系を強化: motor 0.003→0.009、boat 0→0.006。
-# log損失 1.2426→1.2405 / 買い目ROI 277%→301% と両面で改善）
-DEFAULT_WEIGHTS = {
-    "motor":  0.009,   # ③ モーター2連率（平均との差 × この係数）
-    "boat":   0.006,   # ⑭ ボート2連率（同上）
-    "ex":     1.0,     # ④ 展示タイム（平均との差 × この係数）
-    "st":     0.8,     # ⑥ 展示ST
-    "c3":     0.005,   # ⑨ コース別3連対率
-    "recent": 0.25,    # ⑩ 直近3節1着率
+PL_INTERCEPT  = 0.0000
+PL_LANE_COEF  = {1: 0.0000, 2: -0.4488, 3: -0.4927, 4: -0.5105, 5: -0.5102, 6: -0.5639}
+PL_COEF = {
+    "skill":       0.3836,
+    "grade":       0.0175,
+    "motor":       0.1204,
+    "boat":        0.0019,
+    "ex":          0.3461,
+    "weight":     -0.0717,
+    "st":          0.0030,
+    "fl":         -0.0887,
+    "kosetsu":    -0.0095,
+    "c3":          0.5715,
+    "recent1":     0.0108,
+    "season":      1.6219,
+    "course_st":   0.1419,
+    "recent_avg":  0.7390,
 }
 
+# 特徴量のスケール定数（生の値をだいたい -1〜+1 に収める目的の手動正規化。
+# fit_pl_model.py 側でも全く同じ定数を使っている＝学習と推論で特徴量の
+# 定義がずれないよう、この関数を両方から共有する）
 
-def predict(boats: list[dict], conditions: dict | None = None,
-            weights: dict | None = None) -> list[dict]:
-    """
-    14要素による予想スコアリング。気象条件による展示タイム信頼度補正付き。
-
-    ベース  : 蒲郡コース有利度（1コース約55%）
-    補正①  : 選手スキル（全国/当地勝率）
-    補正②  : 級別（A1/A2/B1/B2）
-    補正③  : モーター2連率
-    補正④  : 展示タイム（波高・風速による信頼度補正付き）
-    補正⑤  : 体重（軽い=有利）
-    補正⑥  : 展示ST（速い=有利、F=慎重）
-    補正⑦  : FL歴（フライング持ち=本番慎重）
-    補正⑧  : 今節成績（現節の調子）
-    補正⑨  : コース別3連対率（今日の進入コースでの通算実績）← 重要
-    補正⑩  : 直近3節の1着率（最近の状態）
-    補正⑪  : 現在期の能力指数
-    補正⑫  : コース別ST平均（当該コースでのスタート力）
-    補正⑬  : 直近3節の平均着順（安定した上位着を評価）
-    補正⑭  : ボート2連率（船体の当たり外れ。既定は無効）
-
-    気象補正:
-      波高 >= 10cm → 外コース（4-6）の展示タイム補正を50%に減衰（荒水面）
-      波高 >=  5cm → 外コース（4-6）の展示タイム補正を75%に減衰
-      風速 >=  7m  → 全艇の展示タイム補正を50%に減衰（高風速）
-      風速 >=  4m  → 全艇の展示タイム補正を70%に減衰
-
-    最後に市場（単勝オッズ）の含意確率を ODDS_BLEND の比率でブレンドし、
-    モデル単独の見落としを市場の知恵で補正する（全艇のオッズが取れた時のみ）。
-    """
-    cond  = conditions or {}
-    wave  = cond.get("波高", 0) or 0
-    wind  = cond.get("風速", 0) or 0
-    W     = {**DEFAULT_WEIGHTS, **(weights or {})}
-
-    # 波高・風速による展示タイム信頼度係数
-    wave_factor = 0.50 if wave >= 10 else (0.75 if wave >= 5 else 1.0)
-    wind_factor = 0.50 if wind >= 7  else (0.70 if wind >= 4 else 1.0)
+def pl_context(boats: list[dict], conditions: dict | None = None) -> dict:
+    """レース単位の平均値・気象係数をまとめて計算（1レースにつき1回でよい）"""
+    cond = conditions or {}
+    wave = cond.get("波高", 0) or 0
+    wind = cond.get("風速", 0) or 0
 
     vm  = [b["モーター2連率"] for b in boats if b["モーター2連率"] is not None]
     vbt = [b["ボート2連率"]   for b in boats if b.get("ボート2連率") is not None]
@@ -698,99 +698,111 @@ def predict(boats: list[dict], conditions: dict | None = None,
     vw  = [b["体重"]         for b in boats if b["体重"]         is not None]
     vst = [b["展示ST"]       for b in boats if b["展示ST"] is not None and not b["展示F"]]
 
-    avg_motor  = statistics.mean(vm)  if vm  else 33.0
-    avg_boat   = statistics.mean(vbt) if vbt else 33.0
-    avg_ex     = statistics.mean(vex) if vex else 6.70
-    avg_weight = statistics.mean(vw)  if vw  else 52.0
-    avg_st     = statistics.mean(vst) if vst else 0.15
+    return {
+        "avg_motor":  statistics.mean(vm)  if vm  else 33.0,
+        "avg_boat":   statistics.mean(vbt) if vbt else 33.0,
+        "avg_ex":     statistics.mean(vex) if vex else 6.70,
+        "avg_weight": statistics.mean(vw)  if vw  else 52.0,
+        "avg_st":     statistics.mean(vst) if vst else 0.15,
+        "wave_factor": 0.50 if wave >= 10 else (0.75 if wave >= 5 else 1.0),
+        "wind_factor": 0.50 if wind >= 7  else (0.70 if wind >= 4 else 1.0),
+    }
 
-    scores = []
-    for b in boats:
-        base = LANE_WIN_RATE[b["艇番"]]
 
-        # ① 選手スキル
-        zk    = b["全国勝率"] or 0.0
-        tc    = b["当地勝率"] or 0.0
-        skill = (zk * 0.4 + tc * 0.6) if tc > 0.0 else zk
-        skill_adj = (skill - 5.0) * 0.03
+def pl_features(b: dict, ctx: dict) -> dict[str, float]:
+    """
+    1艇分の特徴量を計算し、-1〜+1程度のスケールに手動正規化した辞書で返す。
+    predict() と fit_pl_model.py の両方から使う（学習と推論の特徴量定義を一致させる）。
+    """
+    lane = b["艇番"]
 
-        # ② 級別
-        grade_adj = {"A1": 0.06, "A2": 0.03, "B1": 0.0, "B2": -0.03}.get(b["級別"], 0.0)
+    zk    = b["全国勝率"] or 0.0
+    tc    = b["当地勝率"] or 0.0
+    skill = (zk * 0.4 + tc * 0.6) if tc > 0.0 else zk
 
-        # ③ モーター
-        m = b["モーター2連率"] if b["モーター2連率"] is not None else avg_motor
-        motor_adj = (m - avg_motor) * W["motor"]
+    grade_ord = {"A1": 3, "A2": 2, "B1": 1, "B2": 0}.get(b["級別"], 1)
 
-        # ⑭ ボート2連率
-        bt = b.get("ボート2連率") if b.get("ボート2連率") is not None else avg_boat
-        boat_adj = (bt - avg_boat) * W["boat"]
+    m  = b["モーター2連率"] if b["モーター2連率"] is not None else ctx["avg_motor"]
+    bt = b.get("ボート2連率") if b.get("ボート2連率") is not None else ctx["avg_boat"]
 
-        # ④ 展示タイム（気象補正あり）
-        ex = b["展示タイム"] if b["展示タイム"] is not None else avg_ex
-        ex_adj_raw = (avg_ex - ex) * W["ex"]
-        # 外コース（4-6）は波高の影響を受けやすい
-        lane_wave = wave_factor if b["艇番"] >= 4 else 1.0
-        ex_adj = ex_adj_raw * lane_wave * wind_factor
+    ex = b["展示タイム"] if b["展示タイム"] is not None else ctx["avg_ex"]
+    lane_wave = ctx["wave_factor"] if lane >= 4 else 1.0
+    ex_dev = (ctx["avg_ex"] - ex) * lane_wave * ctx["wind_factor"]
 
-        # ⑤ 体重
-        w = b["体重"] if b["体重"] is not None else avg_weight
-        weight_adj = (avg_weight - w) * 0.005
+    w = b["体重"] if b["体重"] is not None else ctx["avg_weight"]
 
-        # ⑥ 展示ST
-        st = b["展示ST"]
-        if b["展示F"]:
-            st_adj = -0.05
-        elif st is not None:
-            st_adj = max(-0.12, min(0.12, (avg_st - st) * W["st"]))
-        else:
-            st_adj = 0.0
+    st = b["展示ST"]
+    if b["展示F"]:
+        st_dev = -0.12  # フライング歴と同程度に慎重評価
+    elif st is not None:
+        st_dev = max(-0.12, min(0.12, ctx["avg_st"] - st))
+    else:
+        st_dev = 0.0
 
-        # ⑦ FL歴
-        fl_adj = -0.03 if b["FL回数"] > 0 else 0.0
+    ks = b["今節成績"]
+    kosetsu = (3.5 - sum(ks) / len(ks)) if ks else 0.0
 
-        # ⑧ 今節成績
-        ks = b["今節成績"]
-        kosetsu_adj = (3.5 - sum(ks) / len(ks)) * 0.01 if ks else 0.0
+    cd = b["コース別"].get(lane, {})
+    c3 = cd.get("3連対率")
+    season_races = b["期別成績"].get("期_出走数") or 60
+    entry_rate   = cd.get("進入率", 10.0)
+    est_races    = max(entry_rate / 100 * season_races, 1)
+    smoothed_c3  = (c3 * est_races + 33.0 * 5) / (est_races + 5) if c3 is not None else 33.0
 
-        # ⑨ コース別3連対率（今日の進入コース = 艇番で参照）
-        cd = b["コース別"].get(b["艇番"], {})
-        c3 = cd.get("3連対率")
-        season_races = b["期別成績"].get("期_出走数") or 60
-        entry_rate   = cd.get("進入率", 10.0)
-        est_races    = max(entry_rate / 100 * season_races, 1)
-        # ベイズ平滑化（先験値=33%、強度=5レース）
-        smoothed_c3 = (c3 * est_races + 33.0 * 5) / (est_races + 5) if c3 is not None else 33.0
-        c3rate_adj  = (smoothed_c3 - 33.0) * W["c3"]
+    r1w = b["直近3節"].get("直近1着率")
+    recent1 = r1w if r1w is not None else 0.10
 
-        # ⑩ 直近3節1着率
-        r1w = b["直近3節"].get("直近1着率")
-        recent_adj = max(-0.06, min(0.06, (r1w - 0.10) * W["recent"])) if r1w is not None else 0.0
+    ki = b["期別成績"].get("期_能力指数")
+    ability = ki if ki is not None else 50.0
 
-        # ⑪ 現在期能力指数（50が平均）
-        ki = b["期別成績"].get("期_能力指数")
-        season_adj = (ki - 50.0) * 0.001 if ki is not None else 0.0
+    st_avg_course = cd.get("ST平均")
+    course_st = (0.17 - st_avg_course) if (st_avg_course is not None
+                                            and 0.01 <= st_avg_course <= 0.40) else 0.0
 
-        # ⑫ コース別ST平均（当該コースでのスタート力。0.17が全国平均目安）
-        st_avg_course = cd.get("ST平均")
-        if st_avg_course is not None and 0.01 <= st_avg_course <= 0.40:
-            course_st_adj = max(-0.05, min(0.05, (0.17 - st_avg_course) * 0.4))
-        else:
-            course_st_adj = 0.0
+    r_avg = b["直近3節"].get("直近平均着順")
+    r_n   = b["直近3節"].get("直近出走数", 0)
+    recent_avg = (3.5 - r_avg) if (r_avg is not None and r_n >= 8) else 0.0
 
-        # ⑬ 直近3節の平均着順（3.5が中央値。サンプル8走以上で適用）
-        r_avg = b["直近3節"].get("直近平均着順")
-        r_n   = b["直近3節"].get("直近出走数", 0)
-        if r_avg is not None and r_n >= 8:
-            recent_avg_adj = max(-0.05, min(0.05, (3.5 - r_avg) * 0.02))
-        else:
-            recent_avg_adj = 0.0
+    return {
+        "skill":      (skill - 5.0) / 5.0,
+        "grade":      (grade_ord - 1.5) / 1.5,
+        "motor":      (m - ctx["avg_motor"]) / 10.0,
+        "boat":       (bt - ctx["avg_boat"]) / 10.0,
+        "ex":         ex_dev / 0.10,
+        "weight":     (ctx["avg_weight"] - w) / 3.0,
+        "st":         st_dev / 0.10,
+        "fl":         1.0 if b["FL回数"] > 0 else 0.0,
+        "kosetsu":    kosetsu / 3.5,
+        "c3":         (smoothed_c3 - 33.0) / 33.0,
+        "recent1":    (recent1 - 0.10) / 0.10,
+        "season":     (ability - 50.0) / 50.0,
+        "course_st":  course_st / 0.17,
+        "recent_avg": recent_avg / 3.5,
+    }
 
-        total_adj = (skill_adj + grade_adj + motor_adj + boat_adj + ex_adj
-                     + weight_adj + st_adj + fl_adj + kosetsu_adj
-                     + c3rate_adj + recent_adj + season_adj
-                     + course_st_adj + recent_avg_adj)
 
-        scores.append(max(base * (1.0 + total_adj), 0.001))
+def pl_strength(b: dict, ctx: dict, intercept: float = PL_INTERCEPT,
+                lane_coef: dict | None = None, coef: dict | None = None) -> float:
+    """対数オッズ = 切片 + コース係数 + Σ(特徴量×係数) を強さ(exp)に変換"""
+    lane_coef = lane_coef if lane_coef is not None else PL_LANE_COEF
+    coef      = coef if coef is not None else PL_COEF
+    feats = pl_features(b, ctx)
+    log_odds = intercept + lane_coef.get(b["艇番"], 0.0)
+    for k, v in feats.items():
+        log_odds += coef.get(k, 0.0) * v
+    return math.exp(log_odds)
+
+
+def predict(boats: list[dict], conditions: dict | None = None) -> list[dict]:
+    """
+    Plackett-Luceモデルによる予想スコアリング（詳細は本関数の直前のコメント参照）。
+    気象条件は展示タイムの信頼度補正として特徴量計算に反映済み。
+
+    最後に市場（単勝オッズ）の含意確率を ODDS_BLEND の比率でブレンドし、
+    モデル単独の見落としを市場の知恵で補正する（全艇のオッズが取れた時のみ）。
+    """
+    ctx    = pl_context(boats, conditions)
+    scores = [pl_strength(b, ctx) for b in boats]
 
     total   = sum(scores)
     model_p = [sc / total for sc in scores]
@@ -1350,7 +1362,7 @@ def run_race(date: str, race_no: int, do_discord: bool = False,
         print(f"  3連単: {_fmt_bet_list(bets['3連単'])}")
     weather_note = (f"（気象補正: 波高{wave}cm・風速{wind}m）"
                     if weather_warns else "（気象補正: 適用なし）")
-    print(f"\n  ※ 13要素スコアリング + 気象補正 + 市場ブレンドEV選定(合成≥{COMPOSITE_MIN}倍)  {weather_note}")
+    print(f"\n  ※ Plackett-Luce対数オッズモデル(実データMLE) + 気象補正 + 市場ブレンドEV選定(合成≥{COMPOSITE_MIN}倍)  {weather_note}")
     print(f'{"="*W}\n')
 
     # ── Discord 送信 ──
