@@ -1,0 +1,39 @@
+name: BoatRace Watchdog
+
+# GitHubのschedule cronはこのアカウントで頻繁に遅延・完全に発火しない日がある
+# （競馬BOT側で確認済みの既知の問題。2026-08-27に蒲郡でも終日ゼロ発火が発生）。
+# 対策として、レース時間帯に別ワークフローとして頻繁に自己点検し、
+# 本体（boatrace.yml の send ジョブ）が動いていなければ自動で再起動する。
+
+on:
+  schedule:
+    # レース時間帯 JST 14:00〜21:40（UTC 5:00〜12:40）を20分おきに監視
+    - cron: "0,20,40 5-12 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 稼働確認・未稼働なら再起動
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          ACTIVE=$(gh run list -R sajicosaji/boatrace-gamagori --workflow=boatrace.yml \
+            --json status -q '[.[] | select(.status=="in_progress" or .status=="queued")] | length')
+          if [ "$ACTIVE" -gt 0 ]; then
+            echo "稼働中のジョブが $ACTIVE 件あります。何もしません。"
+            exit 0
+          fi
+          echo "稼働中のジョブなし。予想送信ジョブを起動します。"
+          gh workflow run boatrace.yml -R sajicosaji/boatrace-gamagori --ref master -f mode=predict
+          if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+            curl -s -X POST -H "Content-Type: application/json" \
+              -d '{"content":"🔧 定期実行が止まっていたため、ウォッチドッグが自動再起動しました。"}' \
+              "$DISCORD_WEBHOOK_URL" || true
+          fi
