@@ -20,6 +20,10 @@ on:
           - predict
           - results
         default: predict
+      max_runtime:
+        description: "predict時の最大稼働分数（外部トリガーから上書き用）"
+        type: string
+        default: "130"
 
 permissions:
   contents: write
@@ -30,7 +34,7 @@ jobs:
       (github.event_name == 'schedule' && github.event.schedule != '50 12 * * *') ||
       (github.event_name == 'workflow_dispatch' && inputs.mode == 'predict')
     runs-on: ubuntu-latest
-    timeout-minutes: 140
+    timeout-minutes: 360
     concurrency:
       group: boatrace-send
       cancel-in-progress: false
@@ -49,7 +53,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           AHEAD_MINUTES: "10"
-          MAX_RUNTIME_MIN: "130"
+          MAX_RUNTIME_MIN: ${{ github.event.inputs.max_runtime || '130' }}
           # 勝負レース（期待値プラスの買い目があるレース）だけDiscordに送信する
           HOT_ONLY: "1"
           # 送信記録を sent/ に書き、コミットして夜の結果検証と共有する
