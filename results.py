@@ -172,11 +172,16 @@ def _evaluate_common(result: dict, race_no: int, conf, hot: bool,
 
 
 def evaluate_race_from_log(date: str, race_no: int, rec: dict) -> dict | None:
-    """送信記録（実際に配信した買い目）と結果を照合する。追加の予想計算はしない"""
+    """
+    送信記録（実際に判定した買い目）と結果を照合する。追加の予想計算はしない。
+    「勝負」判定は記録された EV 判定（勝負フィールド）を使う。Discord 送信の
+    成否（送信フィールド）で判定すると、通信エラー等で送信に失敗しただけの
+    本来の勝負レースが「見送り」に化けてしまうため。
+    """
     result = fetch_race_result(date, race_no)
     if result is None:
         return None
-    hot = bool(rec.get("送信"))  # 実際に配信したレースだけを「勝負」扱いにする
+    hot = bool(rec.get("勝負"))
     ex_bets  = [b["組番"] for b in rec.get("2連単", [])] if hot else []
     tri_bets = [b["組番"] for b in rec.get("3連単", [])] if hot else []
     yosou = rec.get("予想順", [])
@@ -223,12 +228,15 @@ def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | N
     schedule = fetch_schedule(date)
     race_nos = [r["race_no"] for r in schedule] or list(range(1, 13))
 
-    log = load_prediction_log(date)
-    # 実際に配信した記録が1件も無い日は、ローカルのお試し実行記録に引きずられず再計算検証する
-    if log and not any(r.get("送信") for r in log.values()):
+    log, log_source = load_prediction_log(date)
+    # sent/（本番の配信記録）は全レース見送りの日でも正式な記録として信用する。
+    # logs/（ローカルのお試し実行）にフォールバックした場合のみ、実際に一度も
+    # 送信していない断片的な記録に引きずられないよう捨てて再計算する。
+    if log_source == "logs" and not any(r.get("送信") for r in log.values()):
         log = {}
     if verbose and log:
-        print(f"  送信記録 {len(log)}レース分を使用（実配信ベースの検証）")
+        src = "本番配信記録" if log_source == "sent" else "ローカル実行記録"
+        print(f"  {src} {len(log)}レース分を使用（実配信ベースの検証）")
 
     evals = []
     for rno in race_nos:
@@ -351,10 +359,12 @@ def main():
         tri_n    = sum(1 for e in all_evals if e["3連単的中"])
         cost     = sum(e["2連単収支"][0] + e["3連単収支"][0] for e in all_evals)
         ret      = sum(e["2連単収支"][1] + e["3連単収支"][1] for e in all_evals)
+        pred_n   = sum(1 for e in all_evals if e["本命"] is not None) or 1
+        roi_total = ret / cost * 100 if cost else 0.0
         print(f"\n{'='*60}")
         print(f"【期間合計】 {n}レース")
-        print(f"  ◎1着 {win_n/n*100:.0f}% / 2連単 {ex_n/n*100:.0f}% / 3連単 {tri_n/n*100:.0f}%")
-        print(f"  総回収率 {ret/cost*100:.0f}%  ({ret:,}円/{cost:,}円  収支{ret-cost:+,}円)")
+        print(f"  ◎1着 {win_n/pred_n*100:.0f}% / 2連単 {ex_n/n*100:.0f}% / 3連単 {tri_n/n*100:.0f}%")
+        print(f"  総回収率 {roi_total:.0f}%  ({ret:,}円/{cost:,}円  収支{ret-cost:+,}円)")
         print(f"{'='*60}")
 
     if args.discord and summaries:

@@ -1181,13 +1181,17 @@ def log_prediction(date: str, race_no: int, ranked: list[dict],
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def load_prediction_log(date: str) -> dict[int, dict]:
-    """日付別の予想記録を読む。{レース番号: 最後の記録}。sent/ を優先、無ければ logs/"""
-    out: dict[int, dict] = {}
+def load_prediction_log(date: str) -> tuple[dict[int, dict], str | None]:
+    """
+    日付別の予想記録を読む。({レース番号: 最後の記録}, 読み込み元) を返す。
+    読み込み元は "sent"（本番の配信記録）/ "logs"（ローカルのお試し実行記録）/ None（記録なし）。
+    sent/ を優先し、無ければ logs/ にフォールバックする。
+    """
     for d in ("sent", "logs"):
         f = Path(__file__).parent / d / f"predictions_{date}.jsonl"
         if not f.exists():
             continue
+        out: dict[int, dict] = {}
         for line in f.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
@@ -1198,8 +1202,8 @@ def load_prediction_log(date: str) -> dict[int, dict]:
             except (ValueError, KeyError):
                 pass
         if out:
-            break
-    return out
+            return out, d
+    return {}, None
 
 
 # ─────────────────────────────────────────────
