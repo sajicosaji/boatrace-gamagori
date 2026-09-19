@@ -864,7 +864,20 @@ W_MODEL_EX     = 0.6    # 2連単: モデル確率の比率（残りは市場確
 EV_MIN_EX      = 1.1    # 2連単: 期待値下限
 P_MIN_EX       = 0.08   # 2連単: ブレンド確率下限
 MAX_BETS_EX    = 2      # 2連単: 最大点数
-W_MODEL_TRI    = 0.4    # 3連単: モデル確率の比率
+
+# 3連単: 2026-09-20 に本番配信記録97レース分（8/11〜9/18の実データ、
+# オッズ・結果とも実測）でバックテストして再設定。
+# 旧設定（軸を2連単と独立に探索、W=0.4）は全期間で的中0/92（払戻0円）と
+# 判明。原因は「2連単で1着と読んだ艇と、3連単が頭に置く艇が食い違う」
+# ケースが多発していたこと（頭の顔ぶれ一致率63%、3連単の頭が実際の1着を
+# 捉えていた割合36%）。3連単の頭を2連単の買い目の頭に固定（独立探索を
+# やめる）し、モデル重みも0.4→0.6に引き上げたところ同じ97レースで
+# 的中1/90・回収率82%まで改善（他のモデル重みでも軸ロックさえすれば
+# プラスに転じることを確認。軸ロックなしでは重みをどう変えても的中0のまま）。
+# ヒット数はまだ少なく（1〜2件）誤差の範囲も大きいため、今後の実運用で
+# 継続的に検証すること。
+TRI_LOCK_TO_EX_AXIS = True  # 3連単の頭を2連単の買い目の頭に固定する
+W_MODEL_TRI    = 0.6    # 3連単: モデル確率の比率（0.4→0.6）
 EV_MIN_TRI     = 1.3    # 3連単: 期待値下限
 P_MIN_TRI      = 0.01   # 3連単: ブレンド確率下限
 MAX_BETS_TRI   = 2      # 3連単: 最大点数
@@ -886,15 +899,20 @@ def _market_probs(odds: dict[str, float]) -> dict[str, float]:
 
 def _select_ev_bets(probs: dict[str, float], odds: dict[str, float],
                     w_model: float, ev_min: float, p_min: float,
-                    max_bets: int) -> list[dict]:
+                    max_bets: int, locked_heads: set[str] | None = None) -> list[dict]:
     """
     ブレンド確率（モデル×市場）で期待値の高い組番を選ぶ。
       条件: ブレンドEV >= ev_min かつ ブレンド確率 >= p_min
       合成オッズが COMPOSITE_MIN を下回らない範囲で EV 順に最大 max_bets 点
+      locked_heads を指定すると、組番の頭（1着候補）がこの集合に
+      含まれるものだけを候補にする（他の買い目と矛盾する頭を独立に
+      探索しないようにする用途。3連単の頭を2連単の頭に固定する等）。
     """
     market = _market_probs(odds)
     cands = []
     for combo, pm in probs.items():
+        if locked_heads is not None and combo.split("-")[0] not in locked_heads:
+            continue
         o = odds.get(combo)
         if not o or o <= 1.0:
             continue
@@ -919,7 +937,9 @@ def recommend_bets(ranked: list[dict],
     """
     期待値ベースの買い目選定（バックテスト済み設定）。
     ① 2連単の選別条件を満たすレースだけを「勝負レース」とする
-    ② 勝負レースにだけ、3連単の穴目（市場が過小評価している組番）を最大2点添える
+    ② 勝負レースにだけ、3連単を最大2点添える。頭は2連単の買い目の頭に
+       固定し（TRI_LOCK_TO_EX_AXIS）、2着・3着の組み合わせだけを
+       期待値順に探す（旧方式は頭も独立に探しており的中0の原因だった）
     ③ どちらも合成オッズ5倍以上を維持できる範囲で点数を絞る
     組番オッズが取得できない場合は従来の確率順（参考表示）にフォールバック。
     """
@@ -944,12 +964,16 @@ def recommend_bets(ranked: list[dict],
     if exacta_odds or trifecta_odds:
         ex_bets = _select_ev_bets(ex_probs, exacta_odds or {},
                                   W_MODEL_EX, EV_MIN_EX, P_MIN_EX, MAX_BETS_EX)
-        # 3連単は勝負レース（2連単条件を満たす）にだけ添える
+        # 3連単は勝負レース（2連単条件を満たす）にだけ添える。
+        # 頭は2連単の買い目の頭に固定し、2連単と矛盾する艇を独立に探しに
+        # 行かないようにする（バックテストで的中0の原因だったため）。
         tri_bets = []
         if ex_bets:
+            locked = ({b["組番"].split("-")[0] for b in ex_bets}
+                     if TRI_LOCK_TO_EX_AXIS else None)
             tri_bets = _select_ev_bets(tri_probs, trifecta_odds or {},
                                        W_MODEL_TRI, EV_MIN_TRI, P_MIN_TRI,
-                                       MAX_BETS_TRI)
+                                       MAX_BETS_TRI, locked_heads=locked)
         mode = "EV"
     else:
         ex_bets  = [{"組番": c, "確率": pr}
