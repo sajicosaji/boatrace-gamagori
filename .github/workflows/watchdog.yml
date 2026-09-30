@@ -22,7 +22,6 @@ jobs:
       - name: 稼働確認・未稼働なら再起動
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           ACTIVE=$(gh run list -R sajicosaji/boatrace-gamagori --workflow=boatrace.yml \
             --json status -q '[.[] | select(.status=="in_progress" or .status=="queued")] | length')
@@ -32,8 +31,3 @@ jobs:
           fi
           echo "稼働中のジョブなし。予想送信ジョブを起動します。"
           gh workflow run boatrace.yml -R sajicosaji/boatrace-gamagori --ref master -f mode=predict
-          if [ -n "$DISCORD_WEBHOOK_URL" ]; then
-            curl -s -X POST -H "Content-Type: application/json" \
-              -d '{"content":"🔧 定期実行が止まっていたため、ウォッチドッグが自動再起動しました。"}' \
-              "$DISCORD_WEBHOOK_URL" || true
-          fi
