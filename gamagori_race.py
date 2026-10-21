@@ -9,11 +9,13 @@
 
 予想: Plackett-Luce対数オッズモデル（実データMLE適合、14特徴量+コース番号）
       + 気象補正 + 市場オッズブレンド
-買い目: 予想勝率から2連単/3連単の的中確率を計算し、
-        レースの自信度（5段階評定、5が最高）と期待値で買い目を選定する。
+買い目: 2本立て（2026-10-21〜）
+  ① EV狙い（本命・レア）: 市場の値ズレを狙う期待値ベースの選定
+  ② ボックス買い（少額・高頻度）: オッズを見ずモデル上位3艇をそのまま総流し
 """
 
 import argparse
+import itertools
 import json
 import math
 import re
@@ -883,6 +885,26 @@ P_MIN_TRI      = 0.01   # 3連単: ブレンド確率下限
 MAX_BETS_TRI   = 2      # 3連単: 最大点数
 COMPOSITE_MIN  = 5.0    # 買い目セットの合成オッズの下限
 
+# ボックス買い（2026-10-21導入）。
+# 上記EV狙い（市場の値ズレを狙う方式）は本番配信記録で2連単・3連単とも
+# ほぼ的中0が続き、「買い目が少なすぎる」というユーザー指摘を受けて
+# 9/29〜10/10の本番10日間・112レース全件（勝負判定に関わらず）の実オッズ・
+# 実結果で検証した結果、オッズを見ずモデル上位3艇をそのまま総流しする
+# 方式のほうが大幅に的中・回収率とも上回ると判明:
+#   2連単 上位3艇box(6点) ◎勝率30%以上のみ: 85%のレースで参戦、
+#     的中59/95、回収率70%
+#   3連単 上位3艇box(6点) ◎勝率35%以上のみ: 71%のレースで参戦、
+#     的中22/80、回収率64%
+# （EV狙いの2連単・3連単は同期間で参戦11R・的中0/0・回収率0%）
+# ただしどちらも回収率は100%未満で、トータルでは依然マイナス。過去に
+# バックテストの好成績が実運用で再現しなかった前例が複数あるため過信は
+# 禁物。ユーザー方針により、EV狙いは本命用として維持しつつ、ボックス買いを
+# 少額・高頻度の別枠として併用する。
+BOX_TOPN        = 3     # ボックスの対象艇数（上位3艇）
+BOX_MIN_P1_EX   = 0.30  # 2連単box: ◎の予想勝率がこれ未満のレースは見送り
+BOX_MIN_P1_TRI  = 0.35  # 3連単box: 同上（3連単は的中条件が厳しいため閾値を上げた）
+BOX_STAKE       = 100   # 1点あたりの賭け金（円）
+
 
 def _composite_odds(bets: list[dict]) -> float:
     """合成オッズ = 1 / Σ(1/各オッズ)。全部買って当たった時の実質倍率。"""
@@ -929,6 +951,28 @@ def _select_ev_bets(probs: dict[str, float], odds: dict[str, float],
         if _composite_odds(chosen + [c]) >= COMPOSITE_MIN:
             chosen.append(c)
     return chosen
+
+
+def _box_bets(p: dict[int, float], length: int, min_p1: float,
+              odds: dict[str, float] | None = None) -> list[dict]:
+    """
+    モデル上位 BOX_TOPN 艇の順列を market odds に関わらず総流しする。
+    ◎（1位艇）の予想勝率が min_p1 未満のレースは荒れすぎると判断し見送り
+    （空リストを返す）。odds を渡すと参考表示用にオッズ・EVも付与する。
+    """
+    ranked = sorted(p.items(), key=lambda kv: -kv[1])
+    if not ranked or ranked[0][1] < min_p1:
+        return []
+    top_boats = [b for b, _ in ranked[:BOX_TOPN]]
+    combos = ["-".join(map(str, c)) for c in itertools.permutations(top_boats, length)]
+    bets = []
+    for combo in combos:
+        o = (odds or {}).get(combo)
+        bet = {"組番": combo, "オッズ": o}
+        if o:
+            bet["EV"] = round(o / len(combos), 2)  # 参考値（均等按分時の期待値相当）
+        bets.append(bet)
+    return bets
 
 
 def recommend_bets(ranked: list[dict],
@@ -982,6 +1026,10 @@ def recommend_bets(ranked: list[dict],
                     for c, pr in sorted(tri_probs.items(), key=lambda kv: -kv[1])[:5]]
         mode = "確率"
 
+    # ボックス買い（少額・高頻度の別枠。EV狙いの的中有無に関わらず判定する）
+    box_ex  = _box_bets(p, 2, BOX_MIN_P1_EX,  exacta_odds)
+    box_tri = _box_bets(p, 3, BOX_MIN_P1_TRI, trifecta_odds)
+
     return {
         "方式":     mode,
         "自信度":   conf,
@@ -989,6 +1037,8 @@ def recommend_bets(ranked: list[dict],
         "3連単":    tri_bets,
         "2連単合成": _composite_odds(ex_bets)  if mode == "EV" else 0.0,
         "3連単合成": _composite_odds(tri_bets) if mode == "EV" else 0.0,
+        "box_2連単": box_ex,
+        "box_3連単": box_tri,
     }
 
 
@@ -1089,13 +1139,24 @@ def _fmt_bet_list(bet_items: list[dict]) -> str:
 
 def is_hot_race(bets: dict) -> bool:
     """
-    「勝負レース」判定:
+    「🔥本命」判定（EV狙い）:
       EV方式  → 期待値プラス（合成5倍以上）の買い目が存在するレース
       確率方式→ オッズ未取得時のフォールバック。自信度5のみ
     """
     if bets.get("方式") == "EV":
         return bool(bets["2連単"] or bets["3連単"])
     return bets["自信度"] >= 5
+
+
+def is_box_race(bets: dict) -> bool:
+    """ボックス買い（少額・高頻度枠）が成立しているか"""
+    return bool(bets.get("box_2連単") or bets.get("box_3連単"))
+
+
+def _fmt_box_list(bet_items: list[dict]) -> str:
+    if not bet_items:
+        return "見送り（◎の信頼度不足）"
+    return ", ".join(b["組番"] for b in bet_items)
 
 
 def _build_discord_msg(ranked: list[dict], conditions: dict,
@@ -1113,7 +1174,7 @@ def _build_discord_msg(ranked: list[dict], conditions: dict,
             reason = f"期待値プラスの買い目 {n}点"
         else:
             reason = "本命の信頼度が最高評価"
-        lines.append(f"🔥🔥 **勝負レース！**（{reason}）🔥🔥")
+        lines.append(f"🔥🔥 **EV本命あり！**（{reason}）🔥🔥")
     stars = "★" * bets["自信度"] + "☆" * (5 - bets["自信度"])
     lines += [
         f"🚤 **【{race_label}】**  自信度: **{bets['自信度']}/5** {stars}",
@@ -1148,14 +1209,22 @@ def _build_discord_msg(ranked: list[dict], conditions: dict,
         lines.append("")
 
     lines.append("```")
+
+    box_ex, box_tri = bets.get("box_2連単", []), bets.get("box_3連単", [])
+    if box_ex or box_tri:
+        cost = BOX_STAKE * (len(box_ex) + len(box_tri))
+        lines.append(f"🎯 ボックス買い（少額枠・上位{BOX_TOPN}艇総流し・計{cost:,}円）")
+        lines.append(f"　 2連単: {_fmt_box_list(box_ex)}")
+        lines.append(f"　 3連単: {_fmt_box_list(box_tri)}")
+
     if bets.get("方式") == "EV":
         g2 = f"  [合成{bets['2連単合成']:.1f}倍]" if bets["2連単"] else ""
         g3 = f"  [合成{bets['3連単合成']:.1f}倍]" if bets["3連単"] else ""
-        lines.append(f"📌 2連単: {_fmt_bet_list(bets['2連単'])}{g2}")
-        lines.append(f"📌 3連単: {_fmt_bet_list(bets['3連単'])}{g3}")
+        lines.append(f"📌 本命(EV狙い)2連単: {_fmt_bet_list(bets['2連単'])}{g2}")
+        lines.append(f"📌 本命(EV狙い)3連単: {_fmt_bet_list(bets['3連単'])}{g3}")
     else:
-        lines.append(f"📌 2連単(参考): {_fmt_bet_list(bets['2連単'])}")
-        lines.append(f"📌 3連単(参考): {_fmt_bet_list(bets['3連単'])}")
+        lines.append(f"📌 本命(参考)2連単: {_fmt_bet_list(bets['2連単'])}")
+        lines.append(f"📌 本命(参考)3連単: {_fmt_bet_list(bets['3連単'])}")
     return "\n".join(lines)
 
 
@@ -1196,9 +1265,12 @@ def log_prediction(date: str, race_no: int, ranked: list[dict],
         "自信度":   bets["自信度"],
         "方式":     bets.get("方式", ""),
         "勝負":     is_hot_race(bets),
+        "ボックス": is_box_race(bets),
         "送信":     sent,
         "2連単":    _bets_full(bets["2連単"]),
         "3連単":    _bets_full(bets["3連単"]),
+        "box_2連単": _bets_full(bets.get("box_2連単", [])),
+        "box_3連単": _bets_full(bets.get("box_3連単", [])),
         "気象":     conditions,
     }
     with open(log_dir / f"predictions_{date}.jsonl", "a", encoding="utf-8") as f:
@@ -1377,27 +1449,38 @@ def run_race(date: str, race_no: int, do_discord: bool = False,
 
     # ── 推奨買い目 ──
     print(f'\n{"="*W}')
+    box_ex, box_tri = bets.get("box_2連単", []), bets.get("box_3連単", [])
+    if box_ex or box_tri:
+        cost = BOX_STAKE * (len(box_ex) + len(box_tri))
+        print(f"【ボックス買い（少額枠・上位{BOX_TOPN}艇総流し・計{cost:,}円）】")
+        print(f"  2連単: {_fmt_box_list(box_ex)}")
+        print(f"  3連単: {_fmt_box_list(box_tri)}")
+    else:
+        print("【ボックス買い】見送り（◎の信頼度不足）")
+
     if bets["方式"] == "EV":
-        hot_s = "🔥勝負レース" if is_hot_race(bets) else "見送り推奨（期待値プラスの組番なし）"
-        print(f"【推奨買い目（期待値ベース）】  自信度: {bets['自信度']}/5  {hot_s}")
+        hot_s = "🔥EV本命あり" if is_hot_race(bets) else "見送り（期待値プラスの組番なし）"
+        print(f"\n【本命(EV狙い)】  自信度: {bets['自信度']}/5  {hot_s}")
         g2 = f"  [合成{bets['2連単合成']:.1f}倍]" if bets["2連単"] else ""
         g3 = f"  [合成{bets['3連単合成']:.1f}倍]" if bets["3連単"] else ""
         print(f"  2連単: {_fmt_bet_list(bets['2連単'])}{g2}")
         print(f"  3連単: {_fmt_bet_list(bets['3連単'])}{g3}")
     else:
-        print(f"【推奨買い目（確率順・参考）】  自信度: {bets['自信度']}/5  ※オッズ未取得")
+        print(f"\n【本命（確率順・参考）】  自信度: {bets['自信度']}/5  ※オッズ未取得")
         print(f"  2連単: {_fmt_bet_list(bets['2連単'])}")
         print(f"  3連単: {_fmt_bet_list(bets['3連単'])}")
     weather_note = (f"（気象補正: 波高{wave}cm・風速{wind}m）"
                     if weather_warns else "（気象補正: 適用なし）")
-    print(f"\n  ※ Plackett-Luce対数オッズモデル(実データMLE) + 気象補正 + 市場ブレンドEV選定(合成≥{COMPOSITE_MIN}倍)  {weather_note}")
+    print(f"\n  ※ Plackett-Luce対数オッズモデル(実データMLE) + 気象補正 + ボックス併用（上位{BOX_TOPN}艇総流し）+ 市場ブレンドEV選定(合成≥{COMPOSITE_MIN}倍)  {weather_note}")
     print(f'{"="*W}\n')
 
     # ── Discord 送信 ──
+    # hot_only は「EV本命またはボックス成立のどちらか」で送信する
+    # （ボックスはほぼ毎レース成立するため、実質ほぼ全レース送信になる）
     sent = False
     if do_discord:
-        if hot_only and not is_hot_race(bets):
-            print(f"Discord: 勝負レース条件を満たさないため送信スキップ（自信度: {bets['自信度']}/5）")
+        if hot_only and not (is_hot_race(bets) or is_box_race(bets)):
+            print(f"Discord: 送信条件（EV本命 or ボックス成立）を満たさないためスキップ（自信度: {bets['自信度']}/5）")
         else:
             webhook_url = load_webhook_url()
             if not webhook_url:

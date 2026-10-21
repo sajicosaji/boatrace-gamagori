@@ -27,7 +27,7 @@ JST = ZoneInfo("Asia/Tokyo")
 from gamagori_race import (
     BASE_URL, VENUE_CODE, FW2HW,
     _fetch, fetch_schedule, get_race_data, predict, recommend_bets,
-    fetch_odds_exacta, fetch_odds_trifecta, is_hot_race,
+    fetch_odds_exacta, fetch_odds_trifecta, is_hot_race, is_box_race,
     load_prediction_log, load_webhook_url, send_discord,
 )
 
@@ -138,36 +138,54 @@ def fetch_race_result(date: str, race_no: int) -> dict | None:
 #  1レースの照合
 # ─────────────────────────────────────────────
 
+def _combo_result(bets: list[str], actual: str | None, payouts: dict[str, int]) -> tuple[int, int]:
+    """(コスト, 払戻) を返す。買い目が無ければ (0, 0)。"""
+    hit = actual in bets if actual else False
+    return 100 * len(bets), (payouts.get(actual, 0) if hit else 0)
+
+
 def _evaluate_common(result: dict, race_no: int, conf, hot: bool,
                      honmei, yosou_jun: list,
-                     ex_bets: list[str], tri_bets: list[str]) -> dict:
+                     ex_bets: list[str], tri_bets: list[str],
+                     box_ex_bets: list[str] | None = None,
+                     box_tri_bets: list[str] | None = None,
+                     box: bool = False) -> dict:
     """着順・払戻と買い目リストを突き合わせて収支を出す共通部"""
+    box_ex_bets  = box_ex_bets or []
+    box_tri_bets = box_tri_bets or []
     finish  = result["着順"]
     winner  = finish[0] if finish else None
     ex_hit_combo  = f"{finish[0]}-{finish[1]}" if len(finish) >= 2 else None
     tri_hit_combo = f"{finish[0]}-{finish[1]}-{finish[2]}" if len(finish) >= 3 else None
 
-    ex_hit  = ex_hit_combo in ex_bets if ex_hit_combo else False
-    tri_hit = tri_hit_combo in tri_bets if tri_hit_combo else False
-
     pay_ex  = result["払戻金"].get("2連単", {})
     pay_tri = result["払戻金"].get("3連単", {})
+
+    ex_cost, ex_ret   = _combo_result(ex_bets, ex_hit_combo, pay_ex)
+    tri_cost, tri_ret = _combo_result(tri_bets, tri_hit_combo, pay_tri)
+    box_ex_cost, box_ex_ret   = _combo_result(box_ex_bets, ex_hit_combo, pay_ex)
+    box_tri_cost, box_tri_ret = _combo_result(box_tri_bets, tri_hit_combo, pay_tri)
 
     return {
         "レース":    race_no,
         "自信度":    conf,
         "勝負":      hot,
+        "ボックス":  box,
         "本命":      honmei,
         "予想順":    yosou_jun,
         "着順":      finish,
         "決まり手":  result["決まり手"],
         "本命的中":  honmei == winner if honmei else False,
-        "2連単的中": ex_hit,
-        "3連単的中": tri_hit,
+        "2連単的中": ex_cost > 0 and ex_ret > 0,
+        "3連単的中": tri_cost > 0 and tri_ret > 0,
         "2連単買い目": ex_bets,
         "3連単買い目": tri_bets,
-        "2連単収支": (100 * len(ex_bets), pay_ex.get(ex_hit_combo, 0) if ex_hit else 0),
-        "3連単収支": (100 * len(tri_bets), pay_tri.get(tri_hit_combo, 0) if tri_hit else 0),
+        "2連単収支": (ex_cost, ex_ret),
+        "3連単収支": (tri_cost, tri_ret),
+        "box_2連単的中": box_ex_cost > 0 and box_ex_ret > 0,
+        "box_3連単的中": box_tri_cost > 0 and box_tri_ret > 0,
+        "box_2連単収支": (box_ex_cost, box_ex_ret),
+        "box_3連単収支": (box_tri_cost, box_tri_ret),
     }
 
 
@@ -176,17 +194,22 @@ def evaluate_race_from_log(date: str, race_no: int, rec: dict) -> dict | None:
     送信記録（実際に判定した買い目）と結果を照合する。追加の予想計算はしない。
     「勝負」判定は記録された EV 判定（勝負フィールド）を使う。Discord 送信の
     成否（送信フィールド）で判定すると、通信エラー等で送信に失敗しただけの
-    本来の勝負レースが「見送り」に化けてしまうため。
+    本来の勝負レースが「見送り」に化けてしまうため。ボックス買い（box_2連単/
+    box_3連単）は EV の勝負判定とは独立に、記録されていればそのまま評価する。
     """
     result = fetch_race_result(date, race_no)
     if result is None:
         return None
     hot = bool(rec.get("勝負"))
+    box = bool(rec.get("ボックス"))
     ex_bets  = [b["組番"] for b in rec.get("2連単", [])] if hot else []
     tri_bets = [b["組番"] for b in rec.get("3連単", [])] if hot else []
+    box_ex_bets  = [b["組番"] for b in rec.get("box_2連単", [])]
+    box_tri_bets = [b["組番"] for b in rec.get("box_3連単", [])]
     yosou = rec.get("予想順", [])
     return _evaluate_common(result, race_no, rec.get("自信度"), hot,
-                            yosou[0] if yosou else None, yosou, ex_bets, tri_bets)
+                            yosou[0] if yosou else None, yosou, ex_bets, tri_bets,
+                            box_ex_bets, box_tri_bets, box)
 
 
 def evaluate_race(date: str, race_no: int, quiet: bool = True) -> dict | None:
@@ -211,7 +234,10 @@ def evaluate_race(date: str, race_no: int, quiet: bool = True) -> dict | None:
     return _evaluate_common(result, race_no, bets["自信度"], is_hot_race(bets),
                             ranked[0]["艇番"], [r["艇番"] for r in ranked],
                             [b["組番"] for b in bets["2連単"]],
-                            [b["組番"] for b in bets["3連単"]])
+                            [b["組番"] for b in bets["3連単"]],
+                            [b["組番"] for b in bets.get("box_2連単", [])],
+                            [b["組番"] for b in bets.get("box_3連単", [])],
+                            is_box_race(bets))
 
 
 # ─────────────────────────────────────────────
@@ -264,6 +290,8 @@ def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | N
     n        = len(evals)
     bet_ev   = [e for e in evals if e["勝負"]]
     nb       = len(bet_ev)
+    box_ev   = [e for e in evals if e["ボックス"]]
+    nbox     = len(box_ev)
     pred_ev  = [e for e in evals if e["本命"] is not None]
     np_      = max(len(pred_ev), 1)
     win_n    = sum(1 for e in pred_ev if e["本命的中"])
@@ -274,17 +302,28 @@ def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | N
     tri_cost = sum(e["3連単収支"][0] for e in evals)
     tri_ret  = sum(e["3連単収支"][1] for e in evals)
 
+    box_ex_n     = sum(1 for e in evals if e["box_2連単的中"])
+    box_tri_n    = sum(1 for e in evals if e["box_3連単的中"])
+    box_ex_cost  = sum(e["box_2連単収支"][0] for e in evals)
+    box_ex_ret   = sum(e["box_2連単収支"][1] for e in evals)
+    box_tri_cost = sum(e["box_3連単収支"][0] for e in evals)
+    box_tri_ret  = sum(e["box_3連単収支"][1] for e in evals)
+
     def roi(ret, cost):
         return ret / cost * 100 if cost else 0.0
 
+    neither_n = sum(1 for e in evals if not e["勝負"] and not e["ボックス"])
     lines = [
-        f"📊 **【蒲郡 {label} 結果検証】** ({n}レース / 🔥勝負{nb} / 見送り{n-nb})",
+        f"📊 **【蒲郡 {label} 結果検証】** ({n}レース / 🔥EV本命{nb} / 🎯ボックス{nbox} / 見送り{neither_n})",
         "```",
         f"◎1着的中 : {win_n}/{len(pred_ev)}  ({win_n/np_*100:.0f}%)",
-        f"2連単的中: {ex_n}回  回収率 {roi(ex_ret, ex_cost):.0f}%  ({ex_ret:,}円/{ex_cost:,}円)",
-        f"3連単的中: {tri_n}回  回収率 {roi(tri_ret, tri_cost):.0f}%  ({tri_ret:,}円/{tri_cost:,}円)",
-        f"合計収支 : {'+' if ex_ret+tri_ret >= ex_cost+tri_cost else ''}{ex_ret+tri_ret-ex_cost-tri_cost:,}円"
-        f"  (回収率 {roi(ex_ret+tri_ret, ex_cost+tri_cost):.0f}%)",
+        f"[EV本命] 2連単: {ex_n}回 回収率{roi(ex_ret,ex_cost):.0f}%({ex_ret:,}/{ex_cost:,}円)  "
+        f"3連単: {tri_n}回 回収率{roi(tri_ret,tri_cost):.0f}%({tri_ret:,}/{tri_cost:,}円)",
+        f"[ボックス] 2連単: {box_ex_n}回 回収率{roi(box_ex_ret,box_ex_cost):.0f}%({box_ex_ret:,}/{box_ex_cost:,}円)  "
+        f"3連単: {box_tri_n}回 回収率{roi(box_tri_ret,box_tri_cost):.0f}%({box_tri_ret:,}/{box_tri_cost:,}円)",
+        f"合計収支 : {'+' if ex_ret+tri_ret+box_ex_ret+box_tri_ret >= ex_cost+tri_cost+box_ex_cost+box_tri_cost else ''}"
+        f"{ex_ret+tri_ret+box_ex_ret+box_tri_ret-ex_cost-tri_cost-box_ex_cost-box_tri_cost:,}円"
+        f"  (回収率 {roi(ex_ret+tri_ret+box_ex_ret+box_tri_ret, ex_cost+tri_cost+box_ex_cost+box_tri_cost):.0f}%)",
         "```",
     ]
 
@@ -292,18 +331,23 @@ def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | N
     for e in evals:
         finish_s = "-".join(map(str, e["着順"][:3]))
         conf_s = f"{e['自信度']}/5" if isinstance(e["自信度"], int) else "-"
-        if not e["勝負"]:
-            hit_lines.append(f"　 {e['レース']:2d}R [見送り] 結果{finish_s}")
-            continue
-        cost = e["2連単収支"][0] + e["3連単収支"][0]
-        gain = e["2連単収支"][1] + e["3連単収支"][1]
+        cost = (e["2連単収支"][0] + e["3連単収支"][0] if e["勝負"] else 0) + \
+               e["box_2連単収支"][0] + e["box_3連単収支"][0]
+        gain = (e["2連単収支"][1] + e["3連単収支"][1] if e["勝負"] else 0) + \
+               e["box_2連単収支"][1] + e["box_3連単収支"][1]
         marks = []
-        if e["2連単的中"]: marks.append(f"2単¥{e['2連単収支'][1]:,}")
-        if e["3連単的中"]: marks.append(f"3単¥{e['3連単収支'][1]:,}")
-        if marks:
-            hit_lines.append(f"🎯 {e['レース']:2d}R [🔥{conf_s}] 結果{finish_s}  {' / '.join(marks)}  ({gain-cost:+,}円)")
+        if e["勝負"]:
+            if e["2連単的中"]: marks.append(f"2単¥{e['2連単収支'][1]:,}")
+            if e["3連単的中"]: marks.append(f"3単¥{e['3連単収支'][1]:,}")
+        if e["box_2連単的中"]: marks.append(f"box2単¥{e['box_2連単収支'][1]:,}")
+        if e["box_3連単的中"]: marks.append(f"box3単¥{e['box_3連単収支'][1]:,}")
+        tag = "🔥" if e["勝負"] else ("🎯" if e["ボックス"] else "　")
+        if not e["勝負"] and not e["ボックス"]:
+            hit_lines.append(f"　 {e['レース']:2d}R [見送り] 結果{finish_s}")
+        elif marks:
+            hit_lines.append(f"🎯 {e['レース']:2d}R [{tag}{conf_s}] 結果{finish_s}  {' / '.join(marks)}  ({gain-cost:+,}円)")
         else:
-            hit_lines.append(f"❌ {e['レース']:2d}R [🔥{conf_s}] 結果{finish_s}  外れ ({-cost:,}円)")
+            hit_lines.append(f"❌ {e['レース']:2d}R [{tag}{conf_s}] 結果{finish_s}  外れ ({-cost:,}円)")
     lines.extend(hit_lines)
 
     return evals, "\n".join(lines)
@@ -359,12 +403,18 @@ def main():
         tri_n    = sum(1 for e in all_evals if e["3連単的中"])
         cost     = sum(e["2連単収支"][0] + e["3連単収支"][0] for e in all_evals)
         ret      = sum(e["2連単収支"][1] + e["3連単収支"][1] for e in all_evals)
+        box_cost = sum(e["box_2連単収支"][0] + e["box_3連単収支"][0] for e in all_evals)
+        box_ret  = sum(e["box_2連単収支"][1] + e["box_3連単収支"][1] for e in all_evals)
         pred_n   = sum(1 for e in all_evals if e["本命"] is not None) or 1
         roi_total = ret / cost * 100 if cost else 0.0
+        roi_box   = box_ret / box_cost * 100 if box_cost else 0.0
         print(f"\n{'='*60}")
         print(f"【期間合計】 {n}レース")
         print(f"  ◎1着 {win_n/pred_n*100:.0f}% / 2連単 {ex_n/n*100:.0f}% / 3連単 {tri_n/n*100:.0f}%")
-        print(f"  総回収率 {roi_total:.0f}%  ({ret:,}円/{cost:,}円  収支{ret-cost:+,}円)")
+        print(f"  [EV本命] 回収率 {roi_total:.0f}%  ({ret:,}円/{cost:,}円  収支{ret-cost:+,}円)")
+        print(f"  [ボックス] 回収率 {roi_box:.0f}%  ({box_ret:,}円/{box_cost:,}円  収支{box_ret-box_cost:+,}円)")
+        tot_c, tot_r = cost + box_cost, ret + box_ret
+        print(f"  [合計] 回収率 {(tot_r/tot_c*100 if tot_c else 0):.0f}%  ({tot_r:,}円/{tot_c:,}円  収支{tot_r-tot_c:+,}円)")
         print(f"{'='*60}")
 
     if args.discord and summaries:
