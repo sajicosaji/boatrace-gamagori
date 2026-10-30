@@ -272,5 +272,10 @@ def update(until: str | None = None) -> str | None:
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "update":
         print("選手成績の更新:", update(sys.argv[2] if len(sys.argv) > 2 else None))
+        # 当日の番組表を先に取得・キャッシュしておく（LZH展開が動くかの確認も兼ねる）
+        today = datetime.now(JST).strftime("%Y%m%d")
+        prog = get_program(today, "07")
+        print(f"当日({today})の蒲郡番組表: {len(prog)}レース"
+              + ("" if prog else "（非開催・未公開・展開失敗のいずれか）"))
     else:
         print("使い方: python mbrace.py update [YYYYMMDD]")
