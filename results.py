@@ -1,37 +1,53 @@
 """
-ボートレース蒲郡 結果検証・バックテストツール
+ボートレース蒲郡 結果検証（v5 記録モード対応・2026-10-30〜）
 
-予想（gamagori_race.py と同じロジック）と実際のレース結果を照合し、
-的中率と回収率（100円/点 で買った場合）を集計する。
+その日の送信記録（sent/predictions_日付.jsonl）と実際の結果を照合する。
+  ・◎の1着的中
+  ・単勝の妙味（締切5分前に判断した買い目）の記録上の収支（1点100円）
+  ・同じ買い目を「確定オッズ」で見直した期待値（締切までのオッズ変動でどれだけ目減りしたか）
+  ・締切10分前/2分前/1分前のオッズで判断していたら（sent/odds_日付.jsonl のスナップショット）
+を集計し、判定ルール.md の事前登録ルールに対する進捗を出す。
+日別の集計は sent/eval_日付.json に保存し、累計はそこから計算する。
 
 使い方:
-  python results.py                      # 今日の全レースを検証
-  python results.py 20260706            # 指定日の全レースを検証
-  python results.py 20260701 20260706   # 期間バックテスト
-  python results.py 20260706 --discord  # 検証結果をDiscordに送信
-
-注意:
-  展示・オッズ・結果はレース後もサイトに残るため、過去日でも検証可能。
-  ただし選手統計（コース別/直近3節/現在期）は「現在の値」なので、
-  過去日に遡るほど当時の予想とズレが生じる（直近数日なら実用上ほぼ同一）。
+  python results.py                      # 今日
+  python results.py 20261031            # 指定日
+  python results.py 20261031 20261105   # 期間（日ごとに検証）
+  python results.py --discord           # サマリーをDiscordに送信
 """
 
 import argparse
+import json
+import os
 import re
-import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
-JST = ZoneInfo("Asia/Tokyo")
-
+import model_v5
 from gamagori_race import (
-    BASE_URL, VENUE_CODE, FW2HW,
-    _fetch, fetch_schedule, get_race_data, predict, recommend_bets,
-    fetch_odds_exacta, fetch_odds_trifecta, is_hot_race, is_box_race,
+    BASE_URL, VENUE_CODE, FW2HW, WIN_EV_MIN, PAPER_STAKE,
+    _fetch, fetch_schedule, fetch_odds_win, fetch_odds_exacta,
     load_prediction_log, load_webhook_url, send_discord,
 )
 
+JST = ZoneInfo("Asia/Tokyo")
+HERE = Path(__file__).parent
+# 書き込み先（Actions は sent/、ローカル実行は logs/ に書いて本番記録を汚さない）。読むときは両方見る
+LOG_DIR = HERE / os.environ.get("PREDICTION_LOG_DIR", "logs")
+READ_DIRS = [LOG_DIR] + ([HERE / "sent"] if LOG_DIR != HERE / "sent" else [])
 FW_RANK = {"１": 1, "２": 2, "３": 3, "４": 4, "５": 5, "６": 6}
+
+# 判定ルール.md（事前登録・判定期間中は変更しない）
+RULE_START = "20261031"
+RULE_PICKS = 300          # 判定に必要な記録点数（締切5分前判断の単勝妙味）
+RULE_PASS_EV = 1.05       # 確定オッズで見直した期待値の平均がこれ以上
+RULE_PASS_ROI = 95.0      # かつ記録上の回収率がこれ以上（%）
+RULE_FAIL_EV = 1.00       # 確定オッズで見直した期待値の平均がこれ未満なら不合格
+RULE_MID = 100            # 中間チェックの点数
+RULE_MID_FAIL_EV = 0.95   # 中間チェックで確定期待値がこれ未満なら早期に不合格
+SEND_TAG = "締切5分前"
+SNAP_TAGS = ["締切10分前", "締切2分前", "締切1分前"]
 
 
 # ─────────────────────────────────────────────
@@ -40,15 +56,10 @@ FW_RANK = {"１": 1, "２": 2, "３": 3, "４": 4, "５": 5, "６": 6}
 
 def fetch_race_result(date: str, race_no: int) -> dict | None:
     """
-    raceresult ページから着順・払戻金・決まり手を取得。
-    レース未確定・非開催日は None を返す。
-
-    返り値例:
-      {
-        "着順":   [5, 1, 6, 2],          # 完走艇の枠番（1着から順）
-        "決まり手": "まくり差し",
-        "払戻金": {"3連単": {"5-1-6": 7380}, "2連単": {"5-1": 3000}, ...},
-      }
+    raceresult ページから着順・払戻金・決まり手・返還艇を取得。未確定・非開催なら None。
+      {"着順": [5, 1, 6, 2], "返還艇": [3], "決まり手": "まくり差し",
+       "払戻金": {"3連単": {"5-1-6": 7380}, "単勝": {"5": 1200}, ...}}
+    返還艇 = フライング・出遅れ・欠場（その艇の舟券は返還される）
     """
     url = (f"{BASE_URL}/owpc/pc/race/raceresult"
            f"?hd={date}&jcd={VENUE_CODE}&rno={race_no}")
@@ -56,56 +67,55 @@ def fetch_race_result(date: str, race_no: int) -> dict | None:
         soup = _fetch(url)
     except Exception:
         return None
-
     tables = soup.find_all("table")
     if len(tables) < 4:
         return None
 
-    # ── 着順テーブル（ヘッダー: 着/枠/ボートレーサー/レースタイム）──
-    finish: list[int] = []
     result_table = None
     for t in tables:
-        header = [c.get_text(strip=True) for c in t.find_all("tr")[0].find_all(["th", "td"])]
+        rows = t.find_all("tr")
+        if not rows:
+            continue
+        header = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
         if header[:2] == ["着", "枠"]:
             result_table = t
             break
     if result_table is None:
         return None
 
-    ranks: list[tuple[int, int]] = []
+    ranks, refund = [], []
     for row in result_table.find_all("tr")[1:]:
         cells = row.find_all(["th", "td"])
         if len(cells) < 3:
             continue
         rank_s = cells[0].get_text(strip=True)
-        lane_s = cells[1].get_text(strip=True)
+        lane_s = cells[1].get_text(strip=True).translate(FW2HW)
+        if not lane_s.isdigit():
+            continue
         rank = FW_RANK.get(rank_s)
         if rank is None:
             hw = rank_s.translate(FW2HW)
             rank = int(hw) if hw.isdigit() and 1 <= int(hw) <= 6 else None
-        if rank is not None and lane_s.isdigit():
+        if rank is not None:
             ranks.append((rank, int(lane_s)))
+        elif any(m in rank_s for m in ("Ｆ", "F", "Ｌ", "L", "欠")):
+            refund.append(int(lane_s))
     ranks.sort()
     finish = [lane for _, lane in ranks]
     if not finish:
-        return None  # 全艇異常などレース不成立
+        return None
 
-    # ── 払戻金テーブル（勝式/組番/払戻金/人気）──
     payouts: dict[str, dict[str, int]] = {}
-    payout_table = None
     for t in tables:
-        header = [c.get_text(strip=True) for c in t.find_all("tr")[0].find_all(["th", "td"])]
-        if header and header[0] == "勝式":
-            payout_table = t
-            break
-
-    if payout_table is not None:
+        rows = t.find_all("tr")
+        header = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])] if rows else []
+        if not header or header[0] != "勝式":
+            continue
         current_kind = None
-        for row in payout_table.find_all("tr")[1:]:
+        for row in rows[1:]:
             cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"])]
             if not cells or not any(cells):
                 continue
-            # 4セル行: [勝式, 組番, 払戻金, 人気] / 3セル行: 同一勝式の続き
             if len(cells) >= 4 and cells[0]:
                 current_kind = cells[0]
                 combo_s, amount_s = cells[1], cells[2]
@@ -113,243 +123,244 @@ def fetch_race_result(date: str, race_no: int) -> dict | None:
                 combo_s, amount_s = cells[0], cells[1]
             else:
                 continue
-
             combo = combo_s.replace(" ", "").replace("　", "")
             m = re.search(r"([\d,]+)", amount_s.replace("¥", ""))
-            if not combo or not m:
-                continue
-            amount = int(m.group(1).replace(",", ""))
-            payouts.setdefault(current_kind, {})[combo] = amount
+            if combo and m:
+                payouts.setdefault(current_kind, {})[combo] = int(m.group(1).replace(",", ""))
+        break
 
-    # ── 決まり手 ──
     kimarite = ""
     for t in tables:
-        header = [c.get_text(strip=True) for c in t.find_all("tr")[0].find_all(["th", "td"])]
+        rows = t.find_all("tr")
+        header = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])] if rows else []
         if header and header[0] == "決まり手":
-            rows = t.find_all("tr")
             if len(rows) > 1:
                 kimarite = rows[1].get_text(strip=True)
             break
 
-    return {"着順": finish, "決まり手": kimarite, "払戻金": payouts}
+    return {"着順": finish, "返還艇": refund, "決まり手": kimarite, "払戻金": payouts}
 
 
 # ─────────────────────────────────────────────
-#  1レースの照合
+#  オッズ記録（スナップショット・確定）
 # ─────────────────────────────────────────────
 
-def _combo_result(bets: list[str], actual: str | None, payouts: dict[str, int]) -> tuple[int, int]:
-    """(コスト, 払戻) を返す。買い目が無ければ (0, 0)。"""
-    hit = actual in bets if actual else False
-    return 100 * len(bets), (payouts.get(actual, 0) if hit else 0)
+def load_odds_snaps(date: str) -> dict[int, dict[str, dict]]:
+    """{レース: {時点: {"単勝": {...}, "2連単": {...}}}}"""
+    out: dict[int, dict[str, dict]] = {}
+    for f in [d / f"odds_{date}.jsonl" for d in READ_DIRS]:
+        if not f.exists():
+            continue
+        for line in f.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(line)
+                out.setdefault(int(r["レース"]), {})[r["時点"]] = r
+            except (ValueError, KeyError):
+                pass
+    return out
 
 
-def _evaluate_common(result: dict, race_no: int, conf, hot: bool,
-                     honmei, yosou_jun: list,
-                     ex_bets: list[str], tri_bets: list[str],
-                     box_ex_bets: list[str] | None = None,
-                     box_tri_bets: list[str] | None = None,
-                     box: bool = False) -> dict:
-    """着順・払戻と買い目リストを突き合わせて収支を出す共通部"""
-    box_ex_bets  = box_ex_bets or []
-    box_tri_bets = box_tri_bets or []
-    finish  = result["着順"]
-    winner  = finish[0] if finish else None
-    ex_hit_combo  = f"{finish[0]}-{finish[1]}" if len(finish) >= 2 else None
-    tri_hit_combo = f"{finish[0]}-{finish[1]}-{finish[2]}" if len(finish) >= 3 else None
-
-    pay_ex  = result["払戻金"].get("2連単", {})
-    pay_tri = result["払戻金"].get("3連単", {})
-
-    ex_cost, ex_ret   = _combo_result(ex_bets, ex_hit_combo, pay_ex)
-    tri_cost, tri_ret = _combo_result(tri_bets, tri_hit_combo, pay_tri)
-    box_ex_cost, box_ex_ret   = _combo_result(box_ex_bets, ex_hit_combo, pay_ex)
-    box_tri_cost, box_tri_ret = _combo_result(box_tri_bets, tri_hit_combo, pay_tri)
-
-    return {
-        "レース":    race_no,
-        "自信度":    conf,
-        "勝負":      hot,
-        "ボックス":  box,
-        "本命":      honmei,
-        "予想順":    yosou_jun,
-        "着順":      finish,
-        "決まり手":  result["決まり手"],
-        "本命的中":  honmei == winner if honmei else False,
-        "2連単的中": ex_cost > 0 and ex_ret > 0,
-        "3連単的中": tri_cost > 0 and tri_ret > 0,
-        "2連単買い目": ex_bets,
-        "3連単買い目": tri_bets,
-        "2連単収支": (ex_cost, ex_ret),
-        "3連単収支": (tri_cost, tri_ret),
-        "box_2連単的中": box_ex_cost > 0 and box_ex_ret > 0,
-        "box_3連単的中": box_tri_cost > 0 and box_tri_ret > 0,
-        "box_2連単収支": (box_ex_cost, box_ex_ret),
-        "box_3連単収支": (box_tri_cost, box_tri_ret),
-    }
+def record_final_odds(date: str, race_no: int, snaps: dict) -> dict:
+    """確定オッズ（単勝・2連単）を取得して記録ファイルに追記（取得済みなら再取得しない）"""
+    if "確定" in snaps.get(race_no, {}):
+        return snaps[race_no]["確定"]
+    rec = {"日付": date, "レース": race_no, "時点": "確定",
+           "記録時刻": datetime.now(JST).isoformat(timespec="seconds"),
+           "単勝": {str(k): v for k, v in fetch_odds_win(date, race_no).items()},
+           "2連単": fetch_odds_exacta(date, race_no)}
+    LOG_DIR.mkdir(exist_ok=True)
+    with open(LOG_DIR / f"odds_{date}.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    snaps.setdefault(race_no, {})["確定"] = rec
+    return rec
 
 
-def evaluate_race_from_log(date: str, race_no: int, rec: dict) -> dict | None:
-    """
-    送信記録（実際に判定した買い目）と結果を照合する。追加の予想計算はしない。
-    「勝負」判定は記録された EV 判定（勝負フィールド）を使う。Discord 送信の
-    成否（送信フィールド）で判定すると、通信エラー等で送信に失敗しただけの
-    本来の勝負レースが「見送り」に化けてしまうため。ボックス買い（box_2連単/
-    box_3連単）は EV の勝負判定とは独立に、記録されていればそのまま評価する。
-    """
-    result = fetch_race_result(date, race_no)
+# ─────────────────────────────────────────────
+#  1レースの評価
+# ─────────────────────────────────────────────
+
+def _picks_at(p1: dict[int, float], win_odds: dict[str, float]) -> list[dict]:
+    """そのオッズで判断した場合の単勝妙味（本番と同じ判定式）"""
+    odds = {int(k): float(v) for k, v in (win_odds or {}).items()}
+    pc = model_v5.combine_win(p1, odds)
+    if not pc:
+        return []
+    return [{"艇番": l, "オッズ": odds[l], "勝率": pc[l], "期待値": pc[l] * odds[l]}
+            for l in p1 if pc[l] * odds[l] >= WIN_EV_MIN]
+
+
+def _settle(picks: list[dict], result: dict, final_win: dict[str, float], p1: dict[int, float]) -> dict:
+    """記録上の収支（1点100円）と、確定オッズで見直した期待値"""
+    tan = result["払戻金"].get("単勝", {})
+    winner = result["着順"][0]
+    fodds = {int(k): float(v) for k, v in (final_win or {}).items()}
+    pcf = model_v5.combine_win(p1, fodds) if fodds else None
+    cost = ret = hits = 0
+    ev_final = []
+    for v in picks:
+        l = int(v["艇番"])
+        cost += PAPER_STAKE
+        if l in result["返還艇"]:
+            ret += PAPER_STAKE
+        elif l == winner:
+            ret += tan.get(str(l), 0) * PAPER_STAKE // 100
+            hits += 1
+        if pcf and l in fodds:
+            ev_final.append(pcf[l] * fodds[l])
+    return {"点数": len(picks), "的中": hits, "投資": cost, "払戻": ret,
+            "判断時期待値": [round(v["期待値"], 3) for v in picks],
+            "確定期待値": [round(x, 3) for x in ev_final],
+            "判断時オッズ": [v["オッズ"] for v in picks],
+            "確定オッズ": [fodds.get(int(v["艇番"])) for v in picks]}
+
+
+def evaluate_race(date: str, rno: int, rec: dict | None, snaps: dict) -> dict | None:
+    result = fetch_race_result(date, rno)
     if result is None:
         return None
-    hot = bool(rec.get("勝負"))
-    box = bool(rec.get("ボックス"))
-    ex_bets  = [b["組番"] for b in rec.get("2連単", [])] if hot else []
-    tri_bets = [b["組番"] for b in rec.get("3連単", [])] if hot else []
-    box_ex_bets  = [b["組番"] for b in rec.get("box_2連単", [])]
-    box_tri_bets = [b["組番"] for b in rec.get("box_3連単", [])]
-    yosou = rec.get("予想順", [])
-    return _evaluate_common(result, race_no, rec.get("自信度"), hot,
-                            yosou[0] if yosou else None, yosou, ex_bets, tri_bets,
-                            box_ex_bets, box_tri_bets, box)
-
-
-def evaluate_race(date: str, race_no: int, quiet: bool = True) -> dict | None:
-    """予想を再計算し、結果と照合して的中・収支を返す（記録が無い日の検証用）"""
-    result = fetch_race_result(date, race_no)
-    if result is None:
-        return None
-
-    try:
-        boats, conditions = get_race_data(date, race_no, quiet=quiet)
-    except Exception as e:
-        print(f"  {race_no}R: 予想データ取得失敗 ({e})")
-        return None
-    if not boats:
-        return None
-
-    ranked = predict(boats, conditions)
-    bets   = recommend_bets(ranked,
-                            fetch_odds_exacta(date, race_no),
-                            fetch_odds_trifecta(date, race_no))
-
-    return _evaluate_common(result, race_no, bets["自信度"], is_hot_race(bets),
-                            ranked[0]["艇番"], [r["艇番"] for r in ranked],
-                            [b["組番"] for b in bets["2連単"]],
-                            [b["組番"] for b in bets["3連単"]],
-                            [b["組番"] for b in bets.get("box_2連単", [])],
-                            [b["組番"] for b in bets.get("box_3連単", [])],
-                            is_box_race(bets))
+    out = {"レース": rno, "着順": result["着順"], "決まり手": result["決まり手"],
+           "単勝払戻": result["払戻金"].get("単勝", {}), "v5": False}
+    if not rec:
+        return out
+    yosou = rec.get("予想順") or []
+    out["本命"] = yosou[0] if yosou else None
+    out["本命的中"] = bool(yosou) and yosou[0] == result["着順"][0]
+    if rec.get("版") != "v5":
+        return out
+    out["v5"] = True
+    p1 = {int(k): float(v) for k, v in rec["予想勝率"].items()}
+    final = record_final_odds(date, rno, snaps)
+    out["送信"] = rec.get("送信", False)
+    out[SEND_TAG] = _settle(rec.get("妙味") or [], result, final["単勝"], p1)
+    out[SEND_TAG]["艇番"] = [v["艇番"] for v in rec.get("妙味") or []]
+    for tag in SNAP_TAGS:
+        s = snaps.get(rno, {}).get(tag)
+        if s:
+            picks = _picks_at(p1, s["単勝"])
+            out[tag] = _settle(picks, result, final["単勝"], p1)
+            out[tag]["艇番"] = [v["艇番"] for v in picks]
+    return out
 
 
 # ─────────────────────────────────────────────
-#  日次サマリー
+#  集計
 # ─────────────────────────────────────────────
+
+def _agg(evals: list[dict], tag: str) -> dict:
+    a = {"点数": 0, "的中": 0, "投資": 0, "払戻": 0, "判断時期待値": [], "確定期待値": [], "レース": 0}
+    for e in evals:
+        s = e.get(tag)
+        if not s:
+            continue
+        a["レース"] += 1
+        for k in ("点数", "的中", "投資", "払戻"):
+            a[k] += s[k]
+        a["判断時期待値"] += s["判断時期待値"]
+        a["確定期待値"] += s["確定期待値"]
+    return a
+
+
+def _fmt_agg(name: str, a: dict) -> str:
+    if not a["点数"]:
+        return f"{name}: 0点"
+    roi = a["払戻"] / a["投資"] * 100 if a["投資"] else 0
+    e0 = sum(a["判断時期待値"]) / len(a["判断時期待値"]) if a["判断時期待値"] else 0
+    e1 = sum(a["確定期待値"]) / len(a["確定期待値"]) if a["確定期待値"] else 0
+    return (f"{name}: {a['点数']}点 的中{a['的中']} 回収率{roi:.0f}%({a['払戻'] - a['投資']:+,}円) "
+            f"期待値 判断時{e0:.2f}→確定{e1:.2f}")
+
+
+def save_eval(date: str, evals: list[dict]) -> None:
+    LOG_DIR.mkdir(exist_ok=True)
+    (LOG_DIR / f"eval_{date}.json").write_text(
+        json.dumps({"日付": date, "レース": evals}, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def cumulative() -> dict[str, dict]:
+    evals = []
+    files = {}
+    for d in reversed(READ_DIRS):  # 同じ日付は書き込み先（LOG_DIR）を優先
+        for f in d.glob("eval_*.json"):
+            files[f.stem] = f
+    for stem, f in sorted(files.items()):
+        if stem.split("_")[1] < RULE_START:
+            continue
+        try:
+            evals += [e for e in json.loads(f.read_text(encoding="utf-8"))["レース"] if e.get("v5")]
+        except (ValueError, KeyError):
+            pass
+    return {tag: _agg(evals, tag) for tag in [SEND_TAG] + SNAP_TAGS}
+
+
+def judgment(c: dict) -> str:
+    a = c[SEND_TAG]
+    n = a["点数"]
+    e1 = sum(a["確定期待値"]) / max(len(a["確定期待値"]), 1)
+    if RULE_MID <= n < RULE_PICKS and e1 < RULE_MID_FAIL_EV:
+        return f"❌ 中間チェックで不合格（{n}点・確定期待値{e1:.2f}<{RULE_MID_FAIL_EV}）→ 判定ルール.md の次の手順へ"
+    if n < RULE_PICKS:
+        return f"判定まで あと{RULE_PICKS - n}点（{n}/{RULE_PICKS}）"
+    roi = a["払戻"] / a["投資"] * 100 if a["投資"] else 0
+    if e1 >= RULE_PASS_EV and roi >= RULE_PASS_ROI:
+        return f"✅ 合格（確定期待値{e1:.2f}≥{RULE_PASS_EV} かつ 回収率{roi:.0f}%≥{RULE_PASS_ROI:.0f}%）→ 少額の実弾を提案"
+    if e1 < RULE_FAIL_EV:
+        return f"❌ 不合格（確定期待値{e1:.2f}<{RULE_FAIL_EV}）→ 判定ルール.md の次の手順へ"
+    return f"⏸ 保留（確定期待値{e1:.2f} / 回収率{roi:.0f}%）→ 判定ルール.md の次の手順へ"
+
 
 def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | None:
-    """
-    当日全レースを照合し、(各レース結果, サマリー文字列) を返す。
-    送信記録（sent/ または logs/ の predictions_日付.jsonl）があれば
-    「実際に配信した買い目」と答え合わせし、無ければ予想を再計算して検証する。
-    """
-    label = f"{date[:4]}/{date[4:6]}/{date[6:]}"
+    label = f"{date[4:6]}/{date[6:]}"
     schedule = fetch_schedule(date)
     race_nos = [r["race_no"] for r in schedule] or list(range(1, 13))
-
-    log, log_source = load_prediction_log(date)
-    # sent/（本番の配信記録）は全レース見送りの日でも正式な記録として信用する。
-    # logs/（ローカルのお試し実行）にフォールバックした場合のみ、実際に一度も
-    # 送信していない断片的な記録に引きずられないよう捨てて再計算する。
-    if log_source == "logs" and not any(r.get("送信") for r in log.values()):
-        log = {}
-    if verbose and log:
-        src = "本番配信記録" if log_source == "sent" else "ローカル実行記録"
-        print(f"  {src} {len(log)}レース分を使用（実配信ベースの検証）")
-
+    log, _ = load_prediction_log(date)
+    snaps = load_odds_snaps(date)
     evals = []
     for rno in race_nos:
         if verbose:
             print(f"  {rno}R を検証中...", flush=True)
-        if log:
-            rec = log.get(rno)
-            if rec:
-                ev = evaluate_race_from_log(date, rno, rec)
-            else:
-                # 記録が無いレース（稼働の谷間など）は結果だけ載せる
-                result = fetch_race_result(date, rno)
-                ev = (_evaluate_common(result, rno, None, False, None, [], [], [])
-                      if result else None)
-        else:
-            ev = evaluate_race(date, rno)
+        ev = evaluate_race(date, rno, log.get(rno), snaps)
         if ev:
             evals.append(ev)
         elif not schedule:
             break
-
     if not evals:
         return None
+    save_eval(date, evals)
 
-    n        = len(evals)
-    bet_ev   = [e for e in evals if e["勝負"]]
-    nb       = len(bet_ev)
-    box_ev   = [e for e in evals if e["ボックス"]]
-    nbox     = len(box_ev)
-    pred_ev  = [e for e in evals if e["本命"] is not None]
-    np_      = max(len(pred_ev), 1)
-    win_n    = sum(1 for e in pred_ev if e["本命的中"])
-    ex_n     = sum(1 for e in bet_ev if e["2連単的中"])
-    tri_n    = sum(1 for e in bet_ev if e["3連単的中"])
-    ex_cost  = sum(e["2連単収支"][0] for e in evals)
-    ex_ret   = sum(e["2連単収支"][1] for e in evals)
-    tri_cost = sum(e["3連単収支"][0] for e in evals)
-    tri_ret  = sum(e["3連単収支"][1] for e in evals)
-
-    box_ex_n     = sum(1 for e in evals if e["box_2連単的中"])
-    box_tri_n    = sum(1 for e in evals if e["box_3連単的中"])
-    box_ex_cost  = sum(e["box_2連単収支"][0] for e in evals)
-    box_ex_ret   = sum(e["box_2連単収支"][1] for e in evals)
-    box_tri_cost = sum(e["box_3連単収支"][0] for e in evals)
-    box_tri_ret  = sum(e["box_3連単収支"][1] for e in evals)
-
-    def roi(ret, cost):
-        return ret / cost * 100 if cost else 0.0
-
-    neither_n = sum(1 for e in evals if not e["勝負"] and not e["ボックス"])
-    lines = [
-        f"📊 **【蒲郡 {label} 結果検証】** ({n}レース / 🔥EV本命{nb} / 🎯ボックス{nbox} / 見送り{neither_n})",
-        "```",
-        f"◎1着的中 : {win_n}/{len(pred_ev)}  ({win_n/np_*100:.0f}%)",
-        f"[EV本命] 2連単: {ex_n}回 回収率{roi(ex_ret,ex_cost):.0f}%({ex_ret:,}/{ex_cost:,}円)  "
-        f"3連単: {tri_n}回 回収率{roi(tri_ret,tri_cost):.0f}%({tri_ret:,}/{tri_cost:,}円)",
-        f"[ボックス] 2連単: {box_ex_n}回 回収率{roi(box_ex_ret,box_ex_cost):.0f}%({box_ex_ret:,}/{box_ex_cost:,}円)  "
-        f"3連単: {box_tri_n}回 回収率{roi(box_tri_ret,box_tri_cost):.0f}%({box_tri_ret:,}/{box_tri_cost:,}円)",
-        f"合計収支 : {'+' if ex_ret+tri_ret+box_ex_ret+box_tri_ret >= ex_cost+tri_cost+box_ex_cost+box_tri_cost else ''}"
-        f"{ex_ret+tri_ret+box_ex_ret+box_tri_ret-ex_cost-tri_cost-box_ex_cost-box_tri_cost:,}円"
-        f"  (回収率 {roi(ex_ret+tri_ret+box_ex_ret+box_tri_ret, ex_cost+tri_cost+box_ex_cost+box_tri_cost):.0f}%)",
-        "```",
-    ]
-
-    hit_lines = []
-    for e in evals:
-        finish_s = "-".join(map(str, e["着順"][:3]))
-        conf_s = f"{e['自信度']}/5" if isinstance(e["自信度"], int) else "-"
-        cost = (e["2連単収支"][0] + e["3連単収支"][0] if e["勝負"] else 0) + \
-               e["box_2連単収支"][0] + e["box_3連単収支"][0]
-        gain = (e["2連単収支"][1] + e["3連単収支"][1] if e["勝負"] else 0) + \
-               e["box_2連単収支"][1] + e["box_3連単収支"][1]
-        marks = []
-        if e["勝負"]:
-            if e["2連単的中"]: marks.append(f"2単¥{e['2連単収支'][1]:,}")
-            if e["3連単的中"]: marks.append(f"3単¥{e['3連単収支'][1]:,}")
-        if e["box_2連単的中"]: marks.append(f"box2単¥{e['box_2連単収支'][1]:,}")
-        if e["box_3連単的中"]: marks.append(f"box3単¥{e['box_3連単収支'][1]:,}")
-        tag = "🔥" if e["勝負"] else ("🎯" if e["ボックス"] else "　")
-        if not e["勝負"] and not e["ボックス"]:
-            hit_lines.append(f"　 {e['レース']:2d}R [見送り] 結果{finish_s}")
-        elif marks:
-            hit_lines.append(f"🎯 {e['レース']:2d}R [{tag}{conf_s}] 結果{finish_s}  {' / '.join(marks)}  ({gain-cost:+,}円)")
-        else:
-            hit_lines.append(f"❌ {e['レース']:2d}R [{tag}{conf_s}] 結果{finish_s}  外れ ({-cost:,}円)")
-    lines.extend(hit_lines)
-
+    pred = [e for e in evals if e.get("本命") is not None]
+    hit = sum(1 for e in pred if e["本命的中"])
+    v5 = [e for e in evals if e.get("v5")]
+    lines = [f"📊 **【蒲郡 {label} 結果】** {len(evals)}レース  ◎1着 {hit}/{len(pred)}"
+             + (f"（{hit / len(pred) * 100:.0f}%）" if pred else "")]
+    if v5:
+        lines.append("```")
+        lines.append(_fmt_agg(f"💡単勝妙味({SEND_TAG}判断)", _agg(v5, SEND_TAG)))
+        for tag in SNAP_TAGS:
+            a = _agg(v5, tag)
+            if a["レース"]:
+                lines.append("  " + _fmt_agg(f"{tag}判断なら", a))
+        lines.append("```")
+        for e in v5:
+            s = e.get(SEND_TAG) or {}
+            if not s.get("点数"):
+                continue
+            res = "-".join(map(str, e["着順"][:3]))
+            mark = "🎯" if s["的中"] else "❌"
+            od = " ".join(f"{b}号艇{o0:.1f}→{o1 if o1 is None else format(o1, '.1f')}倍"
+                          for b, o0, o1 in zip(s["艇番"], s["判断時オッズ"], s["確定オッズ"]))
+            lines.append(f"{mark} {e['レース']:2d}R 単勝{od}  結果{res}  ({s['払戻'] - s['投資']:+,}円)")
+        c = cumulative()
+        lines.append(f"📈 **累計（{RULE_START[4:6]}/{RULE_START[6:]}〜・記録モード）**")
+        lines.append("```")
+        lines.append(_fmt_agg(SEND_TAG, c[SEND_TAG]))
+        for tag in SNAP_TAGS:
+            if c[tag]["レース"]:
+                lines.append(_fmt_agg(tag, c[tag]))
+        lines.append(judgment(c))
+        lines.append("```")
+    else:
+        for e in evals:
+            lines.append(f"　 {e['レース']:2d}R 結果{'-'.join(map(str, e['着順'][:3]))}")
     return evals, "\n".join(lines)
 
 
@@ -360,23 +371,21 @@ def summarize_day(date: str, verbose: bool = True) -> tuple[list[dict], str] | N
 def _daterange(start: str, end: str):
     d0 = datetime.strptime(start, "%Y%m%d").date()
     d1 = datetime.strptime(end, "%Y%m%d").date()
-    d  = d0
+    d = d0
     while d <= d1:
         yield d.strftime("%Y%m%d")
         d += timedelta(days=1)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ボートレース蒲郡 結果検証・バックテスト")
+    parser = argparse.ArgumentParser(description="ボートレース蒲郡 結果検証（v5）")
     parser.add_argument("start", nargs="?", default=None, help="日付 YYYYMMDD（省略=今日）")
-    parser.add_argument("end",   nargs="?", default=None, help="終了日（期間バックテスト時）")
+    parser.add_argument("end",   nargs="?", default=None, help="終了日")
     parser.add_argument("--discord", action="store_true", help="サマリーをDiscordに送信")
     args = parser.parse_args()
 
     start = args.start or datetime.now(JST).strftime("%Y%m%d")
-    end   = args.end or start
-
-    all_evals = []
+    end = args.end or start
     summaries = []
     for d in _daterange(start, end):
         print(f"\n===== {d[:4]}/{d[4:6]}/{d[6:]} =====")
@@ -384,46 +393,19 @@ def main():
         if out is None:
             print("  開催なし（またはレース未確定）")
             continue
-        evals, summary = out
-        all_evals.extend(evals)
-        summaries.append(summary)
+        summaries.append(out[1])
         print()
-        print(summary)
+        print(out[1])
 
-    if not all_evals:
-        # 非開催日は正常な結果なので異常終了にはしない（Actionsで無駄に failure 表示にならないように）
+    if not summaries:
         print("\n検証できたレースがありません（非開催日、または結果未確定）。")
         return
-
-    # 期間合計（複数日のとき）
-    if len(summaries) > 1:
-        n        = len(all_evals)
-        win_n    = sum(1 for e in all_evals if e["本命的中"])
-        ex_n     = sum(1 for e in all_evals if e["2連単的中"])
-        tri_n    = sum(1 for e in all_evals if e["3連単的中"])
-        cost     = sum(e["2連単収支"][0] + e["3連単収支"][0] for e in all_evals)
-        ret      = sum(e["2連単収支"][1] + e["3連単収支"][1] for e in all_evals)
-        box_cost = sum(e["box_2連単収支"][0] + e["box_3連単収支"][0] for e in all_evals)
-        box_ret  = sum(e["box_2連単収支"][1] + e["box_3連単収支"][1] for e in all_evals)
-        pred_n   = sum(1 for e in all_evals if e["本命"] is not None) or 1
-        roi_total = ret / cost * 100 if cost else 0.0
-        roi_box   = box_ret / box_cost * 100 if box_cost else 0.0
-        print(f"\n{'='*60}")
-        print(f"【期間合計】 {n}レース")
-        print(f"  ◎1着 {win_n/pred_n*100:.0f}% / 2連単 {ex_n/n*100:.0f}% / 3連単 {tri_n/n*100:.0f}%")
-        print(f"  [EV本命] 回収率 {roi_total:.0f}%  ({ret:,}円/{cost:,}円  収支{ret-cost:+,}円)")
-        print(f"  [ボックス] 回収率 {roi_box:.0f}%  ({box_ret:,}円/{box_cost:,}円  収支{box_ret-box_cost:+,}円)")
-        tot_c, tot_r = cost + box_cost, ret + box_ret
-        print(f"  [合計] 回収率 {(tot_r/tot_c*100 if tot_c else 0):.0f}%  ({tot_r:,}円/{tot_c:,}円  収支{tot_r-tot_c:+,}円)")
-        print(f"{'='*60}")
-
-    if args.discord and summaries:
+    if args.discord:
         webhook = load_webhook_url()
         if not webhook:
             print("Discord: webhook URL が見つかりません。")
         else:
-            print("\nDiscord に送信中...")
-            ok = all(send_discord(s, webhook) for s in summaries)
+            ok = all(send_discord(s[:1990], webhook) for s in summaries)
             print("  送信完了！" if ok else "  送信失敗。")
 
 

@@ -49,12 +49,27 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # 公式データ（mbrace）の LZH 展開用（bsdtar）
+      - name: Install bsdtar
+        continue-on-error: true
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libarchive-tools
+
+      # 選手の過去成績（player_stats.json）に前日までの競走成績を取り込む
+      - name: Update player stats (mbrace)
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: "utf-8"
+        run: python mbrace.py update
+
       - name: Run check and send (wait-loop)
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          AHEAD_MINUTES: "10"
+          # 予想・送信は締切5分前。オッズだけ締切10/2/1分前にも記録（締切までの変動の検証用）
+          AHEAD_MINUTES: "5"
+          SNAP_EARLY: "10"
+          SNAP_LATE: "2,1"
           MAX_RUNTIME_MIN: ${{ github.event.inputs.max_runtime || '130' }}
-          # 勝負レース（期待値プラスの買い目があるレース）だけDiscordに送信する
+          # 単勝の妙味があるレースだけDiscordに送信する（全レースの予想は記録する）
           HOT_ONLY: "1"
           # 送信記録を sent/ に書き、コミットして夜の結果検証と共有する
           PREDICTION_LOG_DIR: "sent"
@@ -66,7 +81,7 @@ jobs:
         run: |
           git config user.name "boatrace-bot"
           git config user.email "boatrace-bot@users.noreply.github.com"
-          git add sent/ 2>/dev/null || true
+          git add sent/ player_stats.json 2>/dev/null || true
           if ! git diff --cached --quiet; then
             git commit -m "log: sent predictions"
             git pull --rebase origin master || true
@@ -93,5 +108,19 @@ jobs:
       - name: Run daily results summary
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # 確定オッズ・日別集計を sent/ に保存（累計・判定ルールの集計に使う）
+          PREDICTION_LOG_DIR: "sent"
           PYTHONIOENCODING: "utf-8"
         run: python results.py --discord
+
+      - name: Commit results
+        if: always()
+        run: |
+          git config user.name "boatrace-bot"
+          git config user.email "boatrace-bot@users.noreply.github.com"
+          git add sent/ 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "log: results and final odds"
+            git pull --rebase origin master || true
+            git push origin HEAD:master || echo "push failed (non-fatal)"
+          fi

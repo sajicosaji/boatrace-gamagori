@@ -2,8 +2,8 @@
 当日の蒲郡ボートレース全レースをDiscordに自動送信
 
 使い方:
-  python daily_discord.py              # 締切10分前に自動送信
-  python daily_discord.py --ahead 5   # 締切5分前に送信
+  python daily_discord.py              # 締切5分前に自動送信（単勝の妙味があるレースのみ）
+  python daily_discord.py --ahead 10  # 締切10分前に送信
   python daily_discord.py --date 20260706  # 日付指定
 """
 import argparse
@@ -21,8 +21,8 @@ JST = ZoneInfo("Asia/Tokyo")
 
 def main():
     parser = argparse.ArgumentParser(description="ボートレース蒲郡 全レース自動Discord送信")
-    parser.add_argument("--ahead", type=int, default=10,
-                        help="締切何分前に送信するか（デフォルト: 10）")
+    parser.add_argument("--ahead", type=int, default=5,
+                        help="締切何分前に送信するか（デフォルト: 5）")
     parser.add_argument("--date", default=None,
                         help="日付 YYYYMMDD（デフォルト: 今日）")
     args = parser.parse_args()
@@ -79,7 +79,8 @@ def main():
 
         print(f"\n→ 予測送信: {race['race_no']}R  (締切{race['締切']})")
         subprocess.run(
-            [sys.executable, str(script), date_str, str(race["race_no"]), "--discord"],
+            [sys.executable, str(script), date_str, str(race["race_no"]), "--discord",
+             "--hot-only", "--deadline", race["締切"]],
             check=False
         )
         print(f"送信完了\n")
